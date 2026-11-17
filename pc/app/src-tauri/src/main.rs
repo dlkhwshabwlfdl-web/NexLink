@@ -11,6 +11,13 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+/// Wintun adapter backend (Windows only): creates the "NexLink" adapter
+/// and pumps packets to/from the engine's channels. Not wired to the UI
+/// yet — backlog item 2 does that (hence dead_code for now).
+#[cfg(windows)]
+#[allow(dead_code)]
+mod wintun_backend;
+
 use std::io::Read;
 use std::net::TcpStream;
 use std::process::{Command, Stdio};

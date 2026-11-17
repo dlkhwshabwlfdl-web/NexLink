@@ -13,6 +13,13 @@ description = "NexLink for Windows: a tray-only app (settings window + Connect) 
 tauri = { version = "2", features = ["tray-icon"] }
 nxcore = { path = "../../crates/nxcore" }
 
+# Windows only: safe bindings to the WinTun driver (the Wintun backend
+# lives in src/wintun_backend.rs, also #[cfg(windows)]). The DLL itself is
+# bundled by the installer (backlog item 3); `wintun::load()` looks for
+# wintun.dll next to the exe.
+[target.'cfg(windows)'.dependencies]
+wintun = "0.5"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
