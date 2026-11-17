@@ -28,6 +28,9 @@ import android.widget.TextView
  * the app is built around. Nothing connects until the switch is on here
  * *and* Connect is pressed on the PC.
  */
+/** The USB_STATE broadcast action; Android defines no public constant for it. */
+private const val ACTION_USB_STATE = "android.hardware.usb.action.USB_STATE"
+
 class MainActivity : Activity() {
 
     private lateinit var usbDot: TextView
@@ -58,7 +61,7 @@ class MainActivity : Activity() {
         requestRuntimePermissions()
 
         val filter = IntentFilter().apply {
-            addAction(UsbManager.ACTION_USB_STATE)
+            addAction(ACTION_USB_STATE)
             addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
         }
         registerReceiver(stateReceiver, filter)
@@ -183,7 +186,7 @@ class MainActivity : Activity() {
 
     private fun refreshTransports() {
         // USB: the sticky USB_STATE broadcast carries the current state.
-        val usbIntent = registerReceiver(null, IntentFilter(UsbManager.ACTION_USB_STATE))
+        val usbIntent = registerReceiver(null, IntentFilter(ACTION_USB_STATE))
         usbConnected = usbIntent?.getBooleanExtra("connected", false) ?: false
 
         btOn = try {
