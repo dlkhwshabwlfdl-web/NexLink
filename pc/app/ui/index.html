@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NexLink</title>
+<style>
+  :root {
+    --bg: #17181c;
+    --panel: #1f2126;
+    --text: #f2f2f0;
+    --muted: #9a9da6;
+    --accent: #ffd21f;
+    --accent-text: #1a1a1a;
+    --border: #33363e;
+  }
+  * { box-sizing: border-box; font-family: "Segoe UI", system-ui, sans-serif; }
+  body { margin: 0; background: var(--bg); color: var(--text); padding: 20px; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-bottom: 18px; }
+  .group { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  .group label.title { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 10px; }
+  .radio { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 14px; cursor: pointer; }
+  .radio input { accent-color: var(--accent); }
+  .ip { width: 100%; margin-top: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px 10px; font-size: 14px; }
+  .ip:disabled { opacity: .35; }
+  button#connect {
+    width: 100%; border: 0; border-radius: 8px; padding: 12px;
+    background: var(--accent); color: var(--accent-text);
+    font-size: 15px; font-weight: 600; cursor: pointer;
+    box-shadow: 0 3px 0 #a8890a;
+  }
+  button#connect:active { transform: translateY(2px); box-shadow: 0 1px 0 #a8890a; }
+  button#connect:disabled { opacity: .5; cursor: wait; }
+  #status { margin-top: 14px; font-size: 13px; line-height: 1.45; color: var(--muted); min-height: 38px; }
+  #status.ok { color: #7dd87d; }
+  #status.err { color: #ff8a7a; }
+  .row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; font-size: 14px; }
+  .row input { accent-color: var(--accent); width: 17px; height: 17px; }
+</style>
+</head>
+<body>
+  <h1>NexLink</h1>
+  <div class="sub">Your phone's internet — VPN and all — on this PC. No proxy, ever.</div>
+
+  <div class="group">
+    <label class="title">Connection</label>
+    <label class="radio"><input type="radio" name="transport" value="usb" checked /> USB cable (recommended)</label>
+    <label class="radio"><input type="radio" name="transport" value="wifi" /> Wi-Fi</label>
+    <label class="radio"><input type="radio" name="transport" value="bluetooth" /> Bluetooth</label>
+    <input class="ip" id="ip" type="text" placeholder="Phone's Wi-Fi IP, e.g. 192.168.1.50" disabled />
+  </div>
+
+  <button id="connect">Connect</button>
+  <div id="status">Press Connect when your phone is armed. NexLink never connects on its own.</div>
+
+  <div class="group">
+    <label class="title">General</label>
+    <div class="row"><span>Start with Windows</span><input type="checkbox" id="autostart" disabled /></div>
+    <div class="sub" style="margin:0">Autostart arrives with the installer milestone.</div>
+  </div>
+
+<script>
+  const { invoke } = window.__TAURI__.core;
+  const ip = document.getElementById('ip');
+  const status = document.getElementById('status');
+  const button = document.getElementById('connect');
+
+  document.querySelectorAll('input[name=transport]').forEach(r => {
+    r.addEventListener('change', () => {
+      ip.disabled = document.querySelector('input[name=transport]:checked').value !== 'wifi';
+    });
+  });
+
+  button.addEventListener('click', async () => {
+    const transport = document.querySelector('input[name=transport]:checked').value;
+    button.disabled = true;
+    status.className = '';
+    status.textContent = 'Reaching your phone…';
+    try {
+      const msg = await invoke('check_phone', { transport, address: ip.value });
+      status.className = 'ok';
+      status.textContent = msg;
+    } catch (e) {
+      status.className = 'err';
+      status.textContent = String(e);
+    } finally {
+      button.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

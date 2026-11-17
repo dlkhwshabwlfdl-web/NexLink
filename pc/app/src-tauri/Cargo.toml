@@ -1,0 +1,20 @@
+[package]
+name = "nexlink-app"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "NexLink for Windows: a tray-only app (settings window + Connect) built on the nxcore engine."
+
+# Standalone crate: intentionally not a member of the pc/ workspace so the
+# core stays fast to build and test on its own.
+[workspace]
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+nxcore = { path = "../../crates/nxcore" }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[profile.release]
+opt-level = 3

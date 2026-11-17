@@ -1,0 +1,10 @@
+[package]
+name = "nxpump"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Dev harness: binds the NexLink engine to a TUN device (Linux) and an NXLP link. The Windows app embeds the same engine behind Wintun."
+
+[dependencies]
+nxcore = { path = "../nxcore" }
+libc = "0.2"

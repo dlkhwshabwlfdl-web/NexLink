@@ -1,0 +1,17 @@
+[package]
+name = "e2e"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "NexLink end-to-end test: a virtual PC app (its own smoltcp stack) talks through the real engine and the real simphone binary to real local servers. Proves the full data path without needing a TUN device (which sandboxes/CI often can't provide)."
+
+[dependencies]
+nxcore = { path = "../nxcore" }
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std",
+    "alloc",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+] }

@@ -1,0 +1,9 @@
+[package]
+name = "simphone"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A simulated NexLink phone: speaks NXLP and relays flows with host sockets. Used by the end-to-end test; mirrors the Android app's relay semantics."
+
+[dependencies]
+nxcore = { path = "../nxcore" }

@@ -1,0 +1,13 @@
+# Rust
+target/
+**/target/
+
+# Gradle / Android
+.gradle/
+build/
+**/build/
+local.properties
+*.iml
+
+# Misc
+.DS_Store

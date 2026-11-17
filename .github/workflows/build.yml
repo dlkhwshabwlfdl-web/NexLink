@@ -1,0 +1,50 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  core:
+    name: Core (protocol + engine end-to-end)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the test suite
+        run: bash pc/test-e2e.sh
+
+  android:
+    name: Android app (APK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - name: Build debug APK
+        working-directory: android
+        run: gradle :app:assembleDebug --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexlink-android-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+  windows-app:
+    name: Windows tray app (exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the tray app
+        working-directory: pc/app/src-tauri
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexlink-windows-exe
+          path: pc/app/src-tauri/target/release/nexlink-app.exe
