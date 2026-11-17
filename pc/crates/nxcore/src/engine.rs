@@ -132,6 +132,12 @@ struct TcpFlow {
     open: bool,
     pending: VecDeque<Vec<u8>>,
     fin_to_phone: bool,
+    /// The phone half-closed (sent Close FIN). The stack socket must NOT be
+    /// close()d until `pending` has been flushed to the app: smoltcp
+    /// refuses send_slice after close(), which would silently drop the
+    /// tail of the stream whenever Data and Close arrive in one batch.
+    fin_from_phone: bool,
+    fin_sent: bool,
 }
 
 struct UdpFlow {
@@ -237,6 +243,15 @@ impl Engine {
             // 6. Keepalive + link liveness.
             if self.last_debug_dump.elapsed() > Duration::from_secs(2) {
                 self.last_debug_dump = StdInstant::now();
+                for (id, f) in self.tcp_flows.iter() {
+                    let socket = self.sockets.get::<tcp::Socket>(f.handle);
+                    crate::nxlog(format!(
+                        "tcp flow {id}: tuple={:?} state={:?} open={}",
+                        f.tuple,
+                        socket.state(),
+                        f.open
+                    ));
+                }
                 for (id, f) in self.udp_flows.iter() {
                     let socket = self.sockets.get::<udp::Socket>(f.handle);
                     crate::nxlog(format!(
@@ -299,13 +314,15 @@ impl Engine {
             tcp::SocketBuffer::new(vec![0; 64 * 1024]),
         );
         socket.set_nagle_enabled(false);
-        if socket.listen(IpEndpoint::new(IpAddress::Ipv4(dst), dport)).is_err() {
+        if let Err(e) = socket.listen(IpEndpoint::new(IpAddress::Ipv4(dst), dport)) {
+            crate::nxlog(format!("open tcp flow FAILED listen {src}:{sport} -> {dst}:{dport}: {e:?}"));
             return;
         }
         let handle = self.sockets.add(socket);
         let flow = self.next_flow;
         self.next_flow += 1;
-        self.tcp_flows.insert(flow, TcpFlow { handle, tuple, open: false, pending: VecDeque::new(), fin_to_phone: false });
+        crate::nxlog(format!("open tcp flow {flow}: {src}:{sport} -> {dst}:{dport}"));
+        self.tcp_flows.insert(flow, TcpFlow { handle, tuple, open: false, pending: VecDeque::new(), fin_to_phone: false, fin_from_phone: false, fin_sent: false });
         self.tcp_by_tuple.insert(tuple, flow);
         let _ = (src, sport);
         self.queue_frame(&Frame::Open { flow, proto: PROTO_TCP, ip: dst.octets(), port: dport });
@@ -381,11 +398,13 @@ impl Engine {
     fn handle_frame(&mut self, frame: Frame) {
         match frame {
             Frame::OpenOk { flow } => {
+                crate::nxlog(format!("open-ok flow {flow}"));
                 if let Some(f) = self.tcp_flows.get_mut(&flow) {
                     f.open = true;
                 }
             }
-            Frame::OpenErr { flow, .. } => {
+            Frame::OpenErr { flow, code } => {
+                crate::nxlog(format!("open-err flow {flow} code {code}"));
                 if let Some(f) = self.tcp_flows.remove(&flow) {
                     self.tcp_by_tuple.remove(&f.tuple);
                     let socket = self.sockets.get_mut::<tcp::Socket>(f.handle);
@@ -397,6 +416,24 @@ impl Engine {
                 }
             }
             Frame::Data { flow, data } => {
+                // Cap the phone -> app backlog per flow: a phone that sends
+                // faster than the app reads must not grow memory without
+                // bound. Past 4 MiB the flow is reset on both sides.
+                const MAX_PENDING: usize = 4 * 1024 * 1024;
+                let over_cap = match self.tcp_flows.get(&flow) {
+                    Some(f) => f.pending.iter().map(|d| d.len()).sum::<usize>() + data.len() > MAX_PENDING,
+                    None => false,
+                };
+                if over_cap {
+                    if let Some(f) = self.tcp_flows.remove(&flow) {
+                        self.tcp_by_tuple.remove(&f.tuple);
+                        let socket = self.sockets.get_mut::<tcp::Socket>(f.handle);
+                        socket.abort();
+                        self.sockets.remove(f.handle);
+                    }
+                    self.queue_frame(&Frame::Close { flow, flags: CLOSE_RST });
+                    return;
+                }
                 if let Some(f) = self.tcp_flows.get_mut(&flow) {
                     f.pending.push_back(data);
                 } else if let Some(f) = self.udp_flows.get_mut(&flow) {
@@ -415,11 +452,11 @@ impl Engine {
                         self.sockets.remove(f.handle);
                     }
                 } else if let Some(f) = self.tcp_flows.get_mut(&flow) {
-                    // Phone sent everything and half-closed its side: FIN the
-                    // app. smoltcp queues the FIN behind unsent data, and the
-                    // app may still send (FinWait) until it FINs back.
-                    let socket = self.sockets.get_mut::<tcp::Socket>(f.handle);
-                    socket.close();
+                    // Phone sent everything and half-closed its side. Only
+                    // record it here — service_flows closes the stack socket
+                    // once every pending byte has been flushed to the app
+                    // (closing earlier would make smoltcp refuse the data).
+                    f.fin_from_phone = true;
                 }
             }
             Frame::Ping => self.queue_frame(&Frame::Pong),
@@ -460,6 +497,12 @@ impl Engine {
                     Err(_) => break,
                 }
             }
+            // The phone's FIN goes to the app only after the last pending
+            // byte; the app may still send afterwards (half-close).
+            if f.fin_from_phone && f.pending.is_empty() && !f.fin_sent {
+                socket.close();
+                f.fin_sent = true;
+            }
             // App -> phone bytes (only once the phone confirmed the flow).
             if f.open && socket.may_recv() {
                 let mut buf = [0u8; 16 * 1024];
@@ -489,6 +532,12 @@ impl Engine {
             if let Some(f) = self.tcp_flows.remove(&id) {
                 self.tcp_by_tuple.remove(&f.tuple);
                 self.sockets.remove(f.handle);
+                // If the app side died without a FIN (e.g. it aborted),
+                // tell the phone to drop its socket too instead of
+                // leaving it open until its own timeout.
+                if !f.fin_to_phone {
+                    frames.push(Frame::Close { flow: id, flags: CLOSE_RST });
+                }
                 work = true;
             }
         }

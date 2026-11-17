@@ -200,4 +200,28 @@ mod tests {
         }
         assert_eq!(r.next_frame().unwrap(), None);
     }
+
+    #[test]
+    fn oversized_frame_length_is_rejected() {
+        let mut r = FrameReader::new();
+        // A header claiming a 64 MiB body must error, not allocate/wait.
+        r.feed(&(64u32 * 1024 * 1024).to_be_bytes());
+        assert!(r.next_frame().is_err());
+    }
+
+    #[test]
+    fn malformed_frames_error_instead_of_panicking() {
+        // Unknown type byte.
+        let mut r = FrameReader::new();
+        r.feed(&[0, 0, 0, 1, 0x7F]);
+        assert!(r.next_frame().is_err());
+        // OPEN with a truncated payload.
+        let mut r = FrameReader::new();
+        r.feed(&[0, 0, 0, 3, T_OPEN, 0, 0]);
+        assert!(r.next_frame().is_err());
+        // Zero-length body.
+        let mut r = FrameReader::new();
+        r.feed(&[0, 0, 0, 0]);
+        assert!(r.next_frame().is_err());
+    }
 }

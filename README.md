@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/nexlink-logo-256.png" alt="NexLink logo" width="128" />
+</p>
+
 # NexLink
 
 **Share your phone's internet with your PC — VPN, DNS and all — over USB, Wi-Fi or Bluetooth.**

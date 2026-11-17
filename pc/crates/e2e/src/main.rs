@@ -11,13 +11,16 @@
 //! assertions                                  local HTTP server / fake DNS
 //! ```
 //!
-//! Three checks:
+//! Checks:
+//!   0. The fake DNS answers directly (sanity).
 //!   1. An HTTP GET from the virtual app reaches the HTTP server *through*
 //!      the tunnel and the body comes back intact.
 //!   2. A DNS query the app sends to 203.0.113.53:53 is answered by the
 //!      fake resolver (203.0.113.99) — proof of phone-side DNS interception,
 //!      since nothing lives at 203.0.113.53.
 //!   3. With the phone not armed, the handshake reports armed = false.
+//!   4. Two concurrent flows to the same destination both complete.
+//!   5. A 1 MiB body arrives byte for byte.
 //!
 //! Exit code 0 = PASS, 1 = FAIL.
 
@@ -92,6 +95,12 @@ impl Device for ChanDevice {
 // Local servers: HTTP on 127.0.0.1:18080, fake DNS on 127.0.0.1:15353.
 // ---------------------------------------------------------------------------
 
+/// The /big body: 1 MiB of a deterministic pattern the client regenerates
+/// and compares byte for byte.
+fn big_body() -> Vec<u8> {
+    (0..1024 * 1024).map(|i| (i % 251) as u8).collect()
+}
+
 fn start_http_server() {
     let listener = TcpListener::bind("127.0.0.1:18080").expect("http bind");
     std::thread::spawn(move || {
@@ -99,14 +108,25 @@ fn start_http_server() {
             let Ok(mut s) = stream else { continue };
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
-                let _ = s.read(&mut buf);
-                let body = "nexlink-e2e-ok";
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = s.write_all(resp.as_bytes());
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                if req.starts_with("GET /big") {
+                    let body = big_body();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(&body);
+                } else {
+                    let body = "nexlink-e2e-ok";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                }
             });
         }
     });
@@ -376,6 +396,117 @@ fn main() {
         fail("DNS check: no intercepted answer (203.0.113.99) received");
     }
     println!("check 2 OK: DNS query to 203.0.113.53 was resolved by the phone side (answer 203.0.113.99)");
+
+    // -- Check 4: two concurrent flows to the SAME destination --------------
+    // Browsers do this constantly (parallel connections to one host). Both
+    // flows share the destination endpoint, so this exercises the engine's
+    // per-tuple flow dispatch.
+    let mut conc_handles = Vec::new();
+    for port in [49153u16, 49154] {
+        let mut s = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; 16 * 1024]),
+            tcp::SocketBuffer::new(vec![0; 16 * 1024]),
+        );
+        s.connect(
+            app_iface.context(),
+            IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(203, 0, 113, 7)), 18080),
+            port,
+        )
+        .unwrap_or_else(|e| fail(&format!("concurrent connect: {e:?}")));
+        conc_handles.push(sockets.add(s));
+    }
+    let conc_deadline = StdInstant::now() + Duration::from_secs(20);
+    let mut conc_sent = [false, false];
+    let mut conc_body: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    let mut conc_done = [false, false];
+    while StdInstant::now() < conc_deadline && !(conc_done[0] && conc_done[1]) {
+        app_iface.poll(Instant::now(), &mut app_dev, &mut sockets);
+        for (i, h) in conc_handles.iter().enumerate() {
+            let socket = sockets.get_mut::<tcp::Socket>(*h);
+            if !conc_sent[i] && socket.state() == tcp::State::Established {
+                socket
+                    .send_slice(b"GET /hello.txt HTTP/1.0\r\nHost: 203.0.113.7\r\n\r\n")
+                    .unwrap_or_else(|e| fail(&format!("concurrent send: {e:?}")));
+                conc_sent[i] = true;
+            }
+            if conc_sent[i] && socket.may_recv() {
+                let mut buf = [0u8; 8192];
+                match socket.recv_slice(&mut buf) {
+                    Ok(n) => conc_body[i].extend_from_slice(&buf[..n]),
+                    Err(tcp::RecvError::Finished) => conc_done[i] = true,
+                    Err(_) => {}
+                }
+            }
+            if socket.state() == tcp::State::Closed {
+                conc_done[i] = true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for (i, b) in conc_body.iter().enumerate() {
+        let text = String::from_utf8_lossy(b).to_string();
+        if !text.contains("nexlink-e2e-ok") {
+            fail(&format!("concurrent check: flow {i} got unexpected body: {text:?}"));
+        }
+    }
+    println!("check 4 OK: two concurrent flows to the same destination both completed");
+    for h in conc_handles {
+        sockets.remove(h);
+    }
+
+    // -- Check 5: a 1 MiB transfer, byte for byte ----------------------------
+    let mut big_sock = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 256 * 1024]),
+        tcp::SocketBuffer::new(vec![0; 16 * 1024]),
+    );
+    big_sock
+        .connect(
+            app_iface.context(),
+            IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(203, 0, 113, 7)), 18080),
+            49155,
+        )
+        .unwrap_or_else(|e| fail(&format!("big connect: {e:?}")));
+    let big_handle = sockets.add(big_sock);
+    let big_deadline = StdInstant::now() + Duration::from_secs(30);
+    let mut big_sent = false;
+    let mut big_received: Vec<u8> = Vec::new();
+    while StdInstant::now() < big_deadline {
+        app_iface.poll(Instant::now(), &mut app_dev, &mut sockets);
+        let socket = sockets.get_mut::<tcp::Socket>(big_handle);
+        if !big_sent && socket.state() == tcp::State::Established {
+            socket
+                .send_slice(b"GET /big HTTP/1.0\r\nHost: 203.0.113.7\r\n\r\n")
+                .unwrap_or_else(|e| fail(&format!("big send: {e:?}")));
+            big_sent = true;
+        }
+        if big_sent && socket.may_recv() {
+            let mut buf = [0u8; 16384];
+            match socket.recv_slice(&mut buf) {
+                Ok(n) => big_received.extend_from_slice(&buf[..n]),
+                Err(tcp::RecvError::Finished) => break,
+                Err(_) => {}
+            }
+        }
+        if socket.state() == tcp::State::Closed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    sockets.remove(big_handle);
+    let header_end = big_received
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or_else(|| fail("big check: no HTTP header in response"));
+    let payload = &big_received[header_end..];
+    if payload != big_body().as_slice() {
+        fail(&format!(
+            "big check: payload mismatch ({} bytes received, {} expected)",
+            payload.len(),
+            big_body().len()
+        ));
+    }
+    println!("check 5 OK: 1 MiB transferred through the tunnel byte for byte");
 
     // -- Check 3: the arm switch --------------------------------------------
     stop.store(true, Ordering::Relaxed);
