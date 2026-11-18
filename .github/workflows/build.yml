@@ -60,7 +60,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path pc/app/src-tauri/resources | Out-Null
           Copy-Item "$env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll" pc/app/src-tauri/resources/wintun.dll
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version 2 --locked
+        run: cargo install tauri-cli --version "^2" --locked
       - name: Build the NSIS installer
         working-directory: pc/app/src-tauri
         run: cargo tauri build
