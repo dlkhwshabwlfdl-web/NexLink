@@ -208,7 +208,9 @@ class RelaySession(
                 try {
                     Thread.sleep(IDLE_SWEEP_INTERVAL_MS)
                 } catch (_: InterruptedException) {
-                    return
+                    // Session is ending; a bare `return` is prohibited in
+                    // this SAM lambda, so return from it by label.
+                    return@Thread
                 }
                 sweepIdleFlows()
             }
