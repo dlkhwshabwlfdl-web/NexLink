@@ -15,3 +15,7 @@ local.properties
 # The WinTun driver library is fetched by CI (pinned version + SHA-256,
 # see .github/workflows/build.yml) and is not committed.
 pc/app/src-tauri/resources/wintun.dll
+# Same for adb + its DLLs (Android platform-tools, fetched by CI).
+pc/app/src-tauri/resources/adb.exe
+pc/app/src-tauri/resources/AdbWinApi.dll
+pc/app/src-tauri/resources/AdbWinUsbApi.dll

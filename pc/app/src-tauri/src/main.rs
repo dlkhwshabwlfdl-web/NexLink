@@ -92,12 +92,18 @@ impl TunnelState {
     }
 }
 
-/// Find adb: next to our exe first (the shipped bundle), then on PATH.
+/// Find adb: the shipped bundle first (the installer puts adb.exe and
+/// its DLLs in `resources/` next to the exe — same layout as
+/// wintun.dll), then next to the exe itself (hand-built runs), then on
+/// PATH (a developer's own platform-tools).
 fn adb_command() -> Command {
     if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.with_file_name("adb.exe");
-        if sibling.exists() {
-            return Command::new(sibling);
+        if let Some(dir) = exe.parent() {
+            for candidate in [dir.join("adb.exe"), dir.join("resources").join("adb.exe")] {
+                if candidate.exists() {
+                    return Command::new(candidate);
+                }
+            }
         }
     }
     Command::new("adb")

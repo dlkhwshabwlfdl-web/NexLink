@@ -1,6 +1,6 @@
 [package]
 name = "nexlink-app"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 description = "NexLink for Windows: a tray-only app (settings window + Connect) built on the nxcore engine."
