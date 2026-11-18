@@ -9,7 +9,10 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * One PC<->phone link session: reads NXLP frames and relays flows with
@@ -38,10 +41,34 @@ class RelaySession(
     private val flows = ConcurrentHashMap<Long, Flow>()
     private val running = AtomicBoolean(true)
 
+    // DNS answers come from a small fixed pool instead of one thread per
+    // query: a burst of lookups used to spawn unbounded threads.
+    private val dnsPool: ExecutorService = Executors.newFixedThreadPool(DNS_POOL_SIZE) { r ->
+        Thread(r, "NexLink-dns").apply { isDaemon = true }
+    }
+
+    companion object {
+        private const val DNS_POOL_SIZE = 4
+        // A UDP (or DNS) flow with no traffic in either direction for this
+        // long is closed by the phone, even if the PC never sends Close —
+        // otherwise a silent PC leaks a DatagramSocket per flow forever.
+        // The PC engine expires its own side after 60 s; 90 s here means
+        // the phone only steps in when the PC side did not (link stalled,
+        // PC crashed without Bye, ...).
+        private const val UDP_IDLE_TIMEOUT_MS = 90_000L
+        private const val IDLE_SWEEP_INTERVAL_MS = 10_000L
+    }
+
     private sealed class Flow {
         class Tcp(val socket: Socket) : Flow()
-        class Udp(val socket: DatagramSocket, val alive: AtomicBoolean) : Flow()
-        object Dns : Flow()
+        class Udp(
+            val socket: DatagramSocket,
+            val alive: AtomicBoolean,
+            val lastActivity: AtomicLong = AtomicLong(System.currentTimeMillis()),
+        ) : Flow()
+        // Stateless marker: one DNS flow lives per PC resolver flow id and
+        // only carries queries/answers, so it gets the same idle sweep.
+        class Dns(val lastActivity: AtomicLong = AtomicLong(System.currentTimeMillis())) : Flow()
     }
 
     private fun send(frame: Protocol.Frame) {
@@ -57,6 +84,7 @@ class RelaySession(
     }
 
     fun run() {
+        startIdleSweep()
         try {
             val reader = Protocol.Reader(input)
             while (running.get()) {
@@ -77,6 +105,7 @@ class RelaySession(
             Log.i(tag, "session ended: ${e.message}")
         } finally {
             running.set(false)
+            dnsPool.shutdownNow()
             flows.values.forEach { closeQuietly(it) }
             flows.clear()
             try { input.close() } catch (_: Exception) {}
@@ -97,7 +126,7 @@ class RelaySession(
                 if (frame.port == 53) {
                     // DNS interception: the phone resolves, the dialed
                     // address is ignored on purpose (see ARCHITECTURE.md).
-                    flows[frame.flow] = Flow.Dns
+                    flows[frame.flow] = Flow.Dns()
                     send(Protocol.Frame.OpenOk(frame.flow))
                 } else {
                     openUdp(frame.flow, dest, frame.port)
@@ -143,7 +172,8 @@ class RelaySession(
             val socket = DatagramSocket()
             socket.connect(dest, port)
             val alive = AtomicBoolean(true)
-            flows[flow] = Flow.Udp(socket, alive)
+            val udpFlow = Flow.Udp(socket, alive)
+            flows[flow] = udpFlow
             send(Protocol.Frame.OpenOk(flow))
             Thread {
                 val buf = ByteArray(64 * 1024)
@@ -152,6 +182,7 @@ class RelaySession(
                     try {
                         val packet = DatagramPacket(buf, buf.size)
                         socket.receive(packet)
+                        udpFlow.lastActivity.set(System.currentTimeMillis())
                         send(Protocol.Frame.Data(flow, buf.copyOf(packet.length)))
                     } catch (e: java.net.SocketTimeoutException) {
                         // idle tick; loop re-checks the alive flag
@@ -162,6 +193,45 @@ class RelaySession(
             }.start()
         } catch (e: Exception) {
             send(Protocol.Frame.OpenErr(flow, Protocol.ERR_CONNECT_FAILED))
+        }
+    }
+
+    /**
+     * Closes UDP/DNS flows that saw no traffic in either direction for
+     * [UDP_IDLE_TIMEOUT_MS]. Runs on a daemon thread started by [run];
+     * closing the phone socket frees it even when the PC never sends
+     * Close, and the Close FIN tells the PC side the flow is gone.
+     */
+    private fun startIdleSweep() {
+        Thread({
+            while (running.get()) {
+                try {
+                    Thread.sleep(IDLE_SWEEP_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    return
+                }
+                sweepIdleFlows()
+            }
+        }, "NexLink-udp-sweep").apply { isDaemon = true; start() }
+    }
+
+    private fun sweepIdleFlows() {
+        val now = System.currentTimeMillis()
+        val idle = flows.entries
+            .filter { (_, f) ->
+                val last = when (f) {
+                    is Flow.Udp -> f.lastActivity.get()
+                    is Flow.Dns -> f.lastActivity.get()
+                    is Flow.Tcp -> return@filter false
+                }
+                now - last > UDP_IDLE_TIMEOUT_MS
+            }
+            .map { it.key }
+        for (flow in idle) {
+            val removed = flows.remove(flow) ?: continue
+            closeQuietly(removed)
+            send(Protocol.Frame.Close(flow, Protocol.CLOSE_FIN))
+            Log.i(tag, "closed idle udp flow $flow")
         }
     }
 
@@ -180,20 +250,23 @@ class RelaySession(
             is Flow.Udp -> {
                 try {
                     flow.socket.send(DatagramPacket(frame.data, frame.data.size))
+                    flow.lastActivity.set(System.currentTimeMillis())
                 } catch (_: Exception) {
                     // UDP is lossy by nature; a failed send drops the datagram.
                 }
             }
-            Flow.Dns -> {
+            is Flow.Dns -> {
                 val query = frame.data
-                Thread {
+                flow.lastActivity.set(System.currentTimeMillis())
+                dnsPool.execute {
                     val answer = dnsResolver(query)
                     if (answer != null) {
+                        flow.lastActivity.set(System.currentTimeMillis())
                         send(Protocol.Frame.Data(frame.flow, answer))
                     }
                     // No answer -> stay silent; the PC's resolver times out
                     // and retries, exactly like a lost UDP response.
-                }.start()
+                }
             }
             null -> {}
         }
@@ -210,7 +283,7 @@ class RelaySession(
                 f.alive.set(false)
                 try { f.socket.close() } catch (_: Exception) {}
             }
-            Flow.Dns -> {}
+            is Flow.Dns -> {}
         }
     }
 
@@ -221,7 +294,7 @@ class RelaySession(
                 flow.alive.set(false)
                 try { flow.socket.close() } catch (_: Exception) {}
             }
-            Flow.Dns -> {}
+            is Flow.Dns -> {}
         }
     }
 }
