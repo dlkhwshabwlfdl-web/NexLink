@@ -39,6 +39,41 @@ pub fn parse_default_gateway(route_print_stdout: &str) -> Option<Ipv4Addr> {
     best.map(|(_, gateway)| gateway)
 }
 
+/// Parse the output of Windows' `reg query HKCU\...\Run /v <name>` and
+/// return the value's data (the command Windows runs at logon), if the
+/// value exists.
+///
+/// A value line looks like:
+/// ```text
+///     NexLink    REG_SZ    "C:\Program Files\NexLink\NexLink.exe"
+/// ```
+/// The header line (`HKEY_CURRENT_USER\...`) and the trailing blank line
+/// never match. `REG_SZ`/`REG_EXPAND_SZ` are not localized, so this
+/// parses the same on every Windows language. The data may itself
+/// contain spaces (it is the quoted exe path), so everything after the
+/// type token is the data — it is returned untrimmed of its quotes on
+/// purpose; callers compare it against the quoted current exe path.
+pub fn parse_reg_query_value(reg_query_stdout: &str, name: &str) -> Option<String> {
+    for line in reg_query_stdout.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 || fields[0] != name {
+            continue;
+        }
+        if fields[1] != "REG_SZ" && fields[1] != "REG_EXPAND_SZ" {
+            continue;
+        }
+        // The data is everything after the type token, spaces included:
+        // find the type token in the original line and take the rest.
+        let after_type = line.split(fields[1]).nth(1)?;
+        let data = after_type.trim();
+        if data.is_empty() {
+            continue;
+        }
+        return Some(data.to_string());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +127,33 @@ Persistent Routes:
     fn ignores_on_link_and_headers() {
         let out = "Network Destination        Netmask          Gateway       Interface  Metric\n          0.0.0.0          0.0.0.0         On-link      10.0.0.5     10\n";
         assert_eq!(parse_default_gateway(out), None);
+    }
+
+    const REG_QUERY_SAMPLE: &str = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    NexLink    REG_SZ    \"C:\\Program Files\\NexLink\\NexLink.exe\"\r\n    OtherApp    REG_SZ    C:\\Tools\\other.exe\r\n\r\n";
+
+    #[test]
+    fn reg_query_finds_value_with_spaces() {
+        assert_eq!(
+            parse_reg_query_value(REG_QUERY_SAMPLE, "NexLink"),
+            Some("\"C:\\Program Files\\NexLink\\NexLink.exe\"".to_string())
+        );
+    }
+
+    #[test]
+    fn reg_query_other_value() {
+        assert_eq!(
+            parse_reg_query_value(REG_QUERY_SAMPLE, "OtherApp"),
+            Some("C:\\Tools\\other.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn reg_query_missing_value() {
+        assert_eq!(parse_reg_query_value(REG_QUERY_SAMPLE, "Nope"), None);
+    }
+
+    #[test]
+    fn reg_query_empty_output() {
+        assert_eq!(parse_reg_query_value("", "NexLink"), None);
     }
 }

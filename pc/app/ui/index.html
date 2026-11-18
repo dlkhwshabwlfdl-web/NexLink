@@ -53,12 +53,12 @@
 
   <button id="connect">Connect</button>
   <div id="status">Press Connect when your phone is armed. NexLink never connects on its own.</div>
-  <div class="sub" style="margin-top:2px">NexLink must run as administrator — right-click NexLink → Run as administrator. The virtual adapter and its routes need it.</div>
+  <div class="sub" style="margin-top:2px">The installed app asks Windows for administrator rights itself when it starts — the virtual adapter and its routes need them. (A hand-built exe still needs right-click → Run as administrator.)</div>
 
   <div class="group">
     <label class="title">General</label>
-    <div class="row"><span>Start with Windows</span><input type="checkbox" id="autostart" disabled /></div>
-    <div class="sub" style="margin:0">Autostart arrives with the installer milestone.</div>
+    <div class="row"><span>Start with Windows</span><input type="checkbox" id="autostart" /></div>
+    <div class="sub" style="margin:0">With this on, Windows shows a UAC prompt at each logon — the app needs administrator rights to run.</div>
   </div>
 
 <script>
@@ -66,9 +66,28 @@
   const ip = document.getElementById('ip');
   const status = document.getElementById('status');
   const button = document.getElementById('connect');
+  const autostart = document.getElementById('autostart');
   const radios = document.querySelectorAll('input[name=transport]');
   let connected = false;
   let pollTimer = null;
+
+  // "Start with Windows": read the Run key once at startup, then save
+  // on every toggle. On non-Windows builds the command fails and the
+  // checkbox stays off.
+  invoke('get_autostart').then(v => { autostart.checked = !!v; }).catch(() => {});
+  autostart.addEventListener('change', async () => {
+    autostart.disabled = true;
+    try {
+      const msg = await invoke('set_autostart', { enabled: autostart.checked });
+      status.className = '';
+      status.textContent = msg;
+    } catch (e) {
+      autostart.checked = !autostart.checked;
+      status.className = 'err';
+      status.textContent = String(e);
+    }
+    autostart.disabled = false;
+  });
 
   function setTransportEnabled(enabled) {
     radios.forEach(r => { r.disabled = !enabled; });

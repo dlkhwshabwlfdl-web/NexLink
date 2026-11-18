@@ -11,3 +11,7 @@ local.properties
 
 # Misc
 .DS_Store
+
+# The WinTun driver library is fetched by CI (pinned version + SHA-256,
+# see .github/workflows/build.yml) and is not committed.
+pc/app/src-tauri/resources/wintun.dll

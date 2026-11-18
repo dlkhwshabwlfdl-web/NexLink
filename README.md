@@ -42,15 +42,18 @@ protocol → phone-side relay) is implemented and covered by an end-to-end
 test with a simulated phone. The Windows tray app now connects for real:
 after the phone check it opens the Wintun adapter, installs the tunnel
 routes and runs the engine, and Disconnect (or quitting) tears it all
-down. Still to come: the installer with the UAC manifest (until then the
-app must be run as administrator — right-click → Run as administrator),
-and the Bluetooth dialer on the PC side; see the roadmap in
-[ARCHITECTURE.md](ARCHITECTURE.md).
+down. It ships as an NSIS installer (built by CI on every push to main)
+that bundles `wintun.dll` next to the exe, asks Windows for administrator
+rights at launch via its app manifest, and offers a "Start with Windows"
+checkbox in the settings window. Still to come: the Bluetooth dialer on
+the PC side; see the roadmap in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-**Running it (Windows):** NexLink must run **as administrator** — creating
-the virtual adapter and changing routes need elevation. The installer
-milestone will request elevation automatically; until then, right-click
-NexLink → Run as administrator.
+**Running it (Windows):** install from the NSIS installer — the app
+elevates itself via a UAC prompt, because creating the virtual adapter
+and changing routes need administrator rights. (A hand-built exe still
+needs right-click → Run as administrator.) With "Start with Windows" on,
+expect a UAC prompt at each logon — a Task Scheduler entry would avoid
+that, and is a later improvement.
 
 ## Repository layout
 

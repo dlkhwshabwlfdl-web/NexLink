@@ -19,11 +19,15 @@
 //!
 //! Requirements on the machine, both documented here because they bite at
 //! runtime rather than at compile time:
-//! * `wintun.dll` must sit next to the exe — it is bundled by the
-//!   installer (backlog item 3). `wintun::load()` searches the exe's
-//!   directory first.
+//! * `wintun.dll` — bundled by the NSIS installer (backlog item 3) as a
+//!   Tauri resource, i.e. `<install dir>\resources\wintun.dll` (Tauri's
+//!   resource dir is the exe's own directory on Windows). [`load_wintun`]
+//!   also accepts the DLL next to the exe (hand-built runs) and falls
+//!   back to the plain DLL search path (`wintun::load`, e.g. System32).
 //! * The app must run elevated (administrator): creating the adapter and
-//!   setting its address (via `netsh`) both need it.
+//!   setting its address (via `netsh`) both need it. The installed app
+//!   elevates itself — see `windows-app-manifest.xml` (backlog item 3);
+//!   a hand-built exe still needs right-click → Run as administrator.
 //!
 //! The adapter is created with a fresh random GUID each run; if an adapter
 //! named "NexLink" already exists (e.g. left behind by a crashed run) it
@@ -81,20 +85,52 @@ pub struct WintunDevice {
     handles: Vec<JoinHandle<()>>,
 }
 
+/// Find and load `wintun.dll`, trying in order:
+/// 1. `wintun.dll` next to the exe (hand-built runs: drop the DLL there),
+/// 2. `resources/wintun.dll` next to the exe (the NSIS installer bundles
+///    it as a Tauri resource; Tauri's resource dir is the exe's own
+///    directory on Windows),
+/// 3. the plain DLL search path (`wintun::load` — System32, PATH, ...).
+///
+/// SAFETY: wintun.dll is the official WinTun driver library. Loading it
+/// is inherently a trust-the-dll operation; see `wintun::load`'s docs.
+fn load_wintun() -> Result<wintun::Wintun, String> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            for candidate in [exe_dir.join("wintun.dll"), exe_dir.join("resources").join("wintun.dll")]
+            {
+                if candidate.is_file() {
+                    // SAFETY: see the doc comment above.
+                    match unsafe { wintun::load_from_path(&candidate) } {
+                        Ok(w) => return Ok(w),
+                        Err(e) => {
+                            return Err(format!(
+                                "Found wintun.dll at {} but could not load it ({e}). \
+                                 Reinstall NexLink — the installer bundles a fresh copy.",
+                                candidate.display()
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // SAFETY: see the doc comment above.
+    unsafe { wintun::load() }.map_err(|e| {
+        format!(
+            "Could not load wintun.dll ({e}). The installer bundles it under resources/ \
+             next to NexLink.exe — reinstall NexLink; for a hand-built exe, place the \
+             official wintun.dll next to the exe (see README)."
+        )
+    })
+}
+
 impl WintunDevice {
     /// Load `wintun.dll`, create (or reopen) the "NexLink" adapter,
     /// address it 10.77.0.2/24 with gateway 10.77.0.1, start a session and
     /// spawn the two pump threads.
     pub fn open() -> Result<(WintunDevice, WintunChannels), String> {
-        // SAFETY: wintun.dll is the official WinTun driver library, shipped
-        // next to our exe by the installer. Loading it is inherently a
-        // trust-the-dll operation; see `wintun::load`'s docs.
-        let wintun = unsafe { wintun::load() }.map_err(|e| {
-            format!(
-                "Could not load wintun.dll ({e}). Make sure wintun.dll sits next to NexLink.exe \
-                 (the installer bundles it) and the app runs as administrator."
-            )
-        })?;
+        let wintun = load_wintun()?;
 
         // A previous run may have left the adapter behind; reuse it rather
         // than failing. Either way the address is re-applied below.

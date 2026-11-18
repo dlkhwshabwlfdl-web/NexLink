@@ -11,8 +11,10 @@
 //! stops the engine, removes the routes and stops the adapter.
 //!
 //! The app must run elevated (administrator): creating the adapter and
-//! changing routes need it. Until the installer (backlog item 3) adds a
-//! UAC manifest, run it with right-click → Run as administrator.
+//! changing routes need it. The installed app elevates itself — the
+//! manifest (backlog item 3, `windows-app-manifest.xml`) asks Windows
+//! for administrator rights at launch. A hand-built exe still needs
+//! right-click → Run as administrator.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -24,6 +26,10 @@ mod wintun_backend;
 /// Windows route + DNS management for the tunnel (item 2).
 #[cfg(windows)]
 mod routes;
+
+/// "Start with Windows" via the HKCU Run key (item 3).
+#[cfg(windows)]
+mod autostart;
 
 /// Pure network helpers, unit-tested on every platform. Only used by
 /// the Windows routes module — hence the allow on other platforms.
@@ -302,10 +308,50 @@ fn tunnel_status(state: tauri::State<TunnelState>) -> String {
     }
 }
 
+/// The "Start with Windows" checkbox: is the exe in the HKCU Run key?
+/// (Windows only — the checkbox stays off on other builds.)
+#[tauri::command]
+fn get_autostart() -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        autostart::is_enabled()
+    }
+    #[cfg(not(windows))]
+    {
+        Err("Autostart is only available in the Windows build of NexLink.".to_string())
+    }
+}
+
+/// The "Start with Windows" checkbox: write or delete the Run key value.
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        autostart::set_enabled(enabled)?;
+        Ok(if enabled {
+            "NexLink will start with Windows. Note: you will see a UAC prompt at each logon — the app needs administrator rights to run."
+                .to_string()
+        } else {
+            "NexLink will no longer start with Windows.".to_string()
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        Err("Autostart is only available in the Windows build of NexLink.".to_string())
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(TunnelState::new())
-        .invoke_handler(tauri::generate_handler![connect, disconnect, tunnel_status])
+        .invoke_handler(tauri::generate_handler![
+            connect,
+            disconnect,
+            tunnel_status,
+            get_autostart,
+            set_autostart
+        ])
         .setup(|app| {
             // Closing the settings window hides it; the app lives in the tray.
             if let Some(window) = app.get_webview_window("settings") {

@@ -36,15 +36,35 @@ jobs:
           path: android/app/build/outputs/apk/debug/app-debug.apk
 
   windows-app:
-    name: Windows tray app (exe)
+    name: Windows tray app (NSIS installer)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build the tray app
+      # WinTun driver library: the tray app loads it at runtime (see
+      # pc/app/src-tauri/src/wintun_backend.rs) and the installer bundles
+      # it as a Tauri resource (tauri.conf.json). Pinned to the official
+      # wintun.net release and verified by SHA-256 before use; bump both
+      # values together when a newer WinTun ships.
+      - name: Fetch WinTun driver library (pinned + SHA-256 checked)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '0.14.1'
+          $expected = '07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51'
+          $zip = "$env:RUNNER_TEMP\wintun-$version.zip"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-$version.zip" -OutFile $zip
+          $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash
+          if ($actual -ne $expected) { throw "wintun-$version.zip SHA-256 mismatch: got $actual, expected $expected" }
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\wintun" -Force
+          New-Item -ItemType Directory -Force -Path pc/app/src-tauri/resources | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll" pc/app/src-tauri/resources/wintun.dll
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version 2 --locked
+      - name: Build the NSIS installer
         working-directory: pc/app/src-tauri
-        run: cargo build --release
+        run: cargo tauri build
       - uses: actions/upload-artifact@v4
         with:
-          name: nexlink-windows-exe
-          path: pc/app/src-tauri/target/release/nexlink-app.exe
+          name: nexlink-windows-installer
+          path: pc/app/src-tauri/target/release/bundle/nsis/*.exe
