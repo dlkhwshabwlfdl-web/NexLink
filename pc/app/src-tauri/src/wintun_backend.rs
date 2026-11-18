@@ -14,6 +14,9 @@
 //! returns the device handle plus the channel ends; the caller hands the
 //! channels to `Engine::new` and calls `device.stop()` when done.
 //!
+//! Wired to the UI by `main.rs` (backlog item 2, done): Connect opens the
+//! device and hands the channels to the engine thread; Disconnect stops it.
+//!
 //! Requirements on the machine, both documented here because they bite at
 //! runtime rather than at compile time:
 //! * `wintun.dll` must sit next to the exe — it is bundled by the

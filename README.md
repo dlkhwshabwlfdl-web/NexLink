@@ -39,8 +39,18 @@ Full design: [ARCHITECTURE.md](ARCHITECTURE.md)
 
 🚧 **In development.** The core data path (virtual adapter → stack → wire
 protocol → phone-side relay) is implemented and covered by an end-to-end
-test with a simulated phone. Windows tray app and Android app are in
-progress; see the roadmap in [ARCHITECTURE.md](ARCHITECTURE.md).
+test with a simulated phone. The Windows tray app now connects for real:
+after the phone check it opens the Wintun adapter, installs the tunnel
+routes and runs the engine, and Disconnect (or quitting) tears it all
+down. Still to come: the installer with the UAC manifest (until then the
+app must be run as administrator — right-click → Run as administrator),
+and the Bluetooth dialer on the PC side; see the roadmap in
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
+**Running it (Windows):** NexLink must run **as administrator** — creating
+the virtual adapter and changing routes need elevation. The installer
+milestone will request elevation automatically; until then, right-click
+NexLink → Run as administrator.
 
 ## Repository layout
 

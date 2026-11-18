@@ -53,6 +53,7 @@
 
   <button id="connect">Connect</button>
   <div id="status">Press Connect when your phone is armed. NexLink never connects on its own.</div>
+  <div class="sub" style="margin-top:2px">NexLink must run as administrator — right-click NexLink → Run as administrator. The virtual adapter and its routes need it.</div>
 
   <div class="group">
     <label class="title">General</label>
@@ -65,26 +66,82 @@
   const ip = document.getElementById('ip');
   const status = document.getElementById('status');
   const button = document.getElementById('connect');
+  const radios = document.querySelectorAll('input[name=transport]');
+  let connected = false;
+  let pollTimer = null;
 
-  document.querySelectorAll('input[name=transport]').forEach(r => {
+  function setTransportEnabled(enabled) {
+    radios.forEach(r => { r.disabled = !enabled; });
+    ip.disabled = !enabled || document.querySelector('input[name=transport]:checked').value !== 'wifi';
+  }
+
+  function showConnected() {
+    connected = true;
+    button.textContent = 'Disconnect';
+    button.disabled = false;
+    setTransportEnabled(false);
+    pollTimer = setInterval(pollStatus, 2000);
+  }
+
+  function showDisconnected(msg, kind) {
+    connected = false;
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    button.textContent = 'Connect';
+    button.disabled = false;
+    setTransportEnabled(true);
+    status.className = kind || '';
+    status.textContent = msg;
+  }
+
+  // While connected, the engine thread may die on its own (link lost):
+  // the backend tears the tunnel down itself, and this poll surfaces it.
+  async function pollStatus() {
+    try {
+      const s = await invoke('tunnel_status');
+      if (s.startsWith('connected|')) return;
+      if (s.startsWith('dead|')) {
+        showDisconnected('Connection lost: ' + s.slice(5) + ' Routes were removed automatically — press Connect to try again.', 'err');
+      } else if (s.startsWith('disconnected|')) {
+        showDisconnected('Disconnected. ' + s.slice(13), '');
+      } else {
+        showDisconnected('Disconnected.', '');
+      }
+    } catch (e) { /* transient; try again next tick */ }
+  }
+
+  radios.forEach(r => {
     r.addEventListener('change', () => {
       ip.disabled = document.querySelector('input[name=transport]:checked').value !== 'wifi';
     });
   });
 
   button.addEventListener('click', async () => {
+    if (connected) {
+      button.disabled = true;
+      status.className = '';
+      status.textContent = 'Disconnecting…';
+      try {
+        const msg = await invoke('disconnect');
+        showDisconnected(msg, '');
+      } catch (e) {
+        status.className = 'err';
+        status.textContent = String(e);
+        button.disabled = false;
+      }
+      return;
+    }
     const transport = document.querySelector('input[name=transport]:checked').value;
     button.disabled = true;
     status.className = '';
     status.textContent = 'Reaching your phone…';
     try {
-      const msg = await invoke('check_phone', { transport, address: ip.value });
+      const msg = await invoke('connect', { transport, address: ip.value });
       status.className = 'ok';
       status.textContent = msg;
+      showConnected();
     } catch (e) {
       status.className = 'err';
       status.textContent = String(e);
-    } finally {
       button.disabled = false;
     }
   });
