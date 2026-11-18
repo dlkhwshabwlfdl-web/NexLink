@@ -222,8 +222,8 @@ class RelaySession(
                 val last = when (f) {
                     is Flow.Udp -> f.lastActivity.get()
                     is Flow.Dns -> f.lastActivity.get()
-                    is Flow.Tcp -> return@filter false
-                }
+                    is Flow.Tcp -> null
+                } ?: return@filter false
                 now - last > UDP_IDLE_TIMEOUT_MS
             }
             .map { it.key }
