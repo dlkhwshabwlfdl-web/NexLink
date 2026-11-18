@@ -21,6 +21,10 @@
 //!   3. With the phone not armed, the handshake reports armed = false.
 //!   4. Two concurrent flows to the same destination both complete.
 //!   5. A 1 MiB body arrives byte for byte.
+//!   6. A TCP flow whose app never reads is reset by the engine when the
+//!      phone floods past the 4 MiB pending cap (the server holds the
+//!      connection open afterwards, so only the engine's RST can close
+//!      the app socket).
 //!
 //! Exit code 0 = PASS, 1 = FAIL.
 
@@ -118,6 +122,27 @@ fn start_http_server() {
                     );
                     let _ = s.write_all(head.as_bytes());
                     let _ = s.write_all(&body);
+                } else if req.starts_with("GET /flood") {
+                    // 6 MiB, deliberately past the engine's 4 MiB
+                    // per-flow pending cap. The connection is then held
+                    // open (no FIN): check 6 relies on that, so the only
+                    // thing that can close the app socket is the engine
+                    // resetting the flow.
+                    let total = 6 * 1024 * 1024;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = s.write_all(head.as_bytes());
+                    let chunk: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+                    let mut left = total;
+                    while left > 0 {
+                        let n = left.min(chunk.len());
+                        if s.write_all(&chunk[..n]).is_err() {
+                            break;
+                        }
+                        left -= n;
+                    }
+                    std::thread::sleep(Duration::from_secs(60));
                 } else {
                     let body = "nexlink-e2e-ok";
                     let resp = format!(
@@ -507,6 +532,53 @@ fn main() {
         ));
     }
     println!("check 5 OK: 1 MiB transferred through the tunnel byte for byte");
+
+    // -- Check 6: unread flow flooded past the 4 MiB cap is reset --------
+    // The app opens a flow, asks for 6 MiB, and then never reads a byte.
+    // The engine's stack socket can only push ~its window into the app,
+    // so the phone -> app backlog grows past the 4 MiB cap and the engine
+    // must abort the stack socket (RST to the app) and Close-RST the
+    // phone. The server holds its connection open, so a Closed app
+    // socket here can only mean the engine reset the flow.
+    let mut flood_sock = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 16 * 1024]),
+        tcp::SocketBuffer::new(vec![0; 16 * 1024]),
+    );
+    flood_sock
+        .connect(
+            app_iface.context(),
+            IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(203, 0, 113, 7)), 18080),
+            49156,
+        )
+        .unwrap_or_else(|e| fail(&format!("flood connect: {e:?}")));
+    let flood_handle = sockets.add(flood_sock);
+    let flood_deadline = StdInstant::now() + Duration::from_secs(30);
+    let mut flood_sent = false;
+    let mut flood_reset = false;
+    while StdInstant::now() < flood_deadline {
+        app_iface.poll(Instant::now(), &mut app_dev, &mut sockets);
+        let socket = sockets.get_mut::<tcp::Socket>(flood_handle);
+        if !flood_sent && socket.state() == tcp::State::Established {
+            socket
+                .send_slice(b"GET /flood HTTP/1.0\r\nHost: 203.0.113.7\r\n\r\n")
+                .unwrap_or_else(|e| fail(&format!("flood send: {e:?}")));
+            flood_sent = true;
+        }
+        // Deliberately never recv: the app is not reading.
+        if socket.state() == tcp::State::Closed {
+            flood_reset = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    sockets.remove(flood_handle);
+    if !flood_sent {
+        fail("flood check: flow never reached Established");
+    }
+    if !flood_reset {
+        fail("flood check: unread flow was NOT reset after the phone flooded past the 4 MiB cap");
+    }
+    println!("check 6 OK: unread flow flooded past the 4 MiB cap was reset by the engine");
 
     // -- Check 3: the arm switch --------------------------------------------
     stop.store(true, Ordering::Relaxed);

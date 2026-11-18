@@ -202,6 +202,118 @@ mod tests {
     }
 
     #[test]
+    fn fuzz_frame_reader_never_panics() {
+        // Deterministic xorshift64 PRNG (no extra deps; fixed seed so the
+        // test is stable in CI). Feeds the reader random bytes, mutated
+        // valid frames and garbage spliced between frames, in random-sized
+        // chunks (sometimes one byte at a time). Any input must decode,
+        // return Ok(None) for a partial frame, or error — never panic.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n.max(1) as u64) as usize
+            }
+        }
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let valid: Vec<Vec<u8>> = [
+            Frame::Hello { version: 1, name: "pc".into() },
+            Frame::HelloAck { armed: true, name: "phone".into() },
+            Frame::Open { flow: 7, proto: PROTO_TCP, ip: [203, 0, 113, 7], port: 443 },
+            Frame::OpenOk { flow: 7 },
+            Frame::OpenErr { flow: 7, code: ERR_CONNECT_FAILED },
+            Frame::Data { flow: 7, data: vec![1, 2, 3, 250] },
+            Frame::Close { flow: 7, flags: CLOSE_FIN },
+            Frame::Ping,
+            Frame::Pong,
+            Frame::Bye,
+        ]
+        .iter()
+        .map(|f| {
+            let mut b = Vec::new();
+            f.encode(&mut b);
+            b
+        })
+        .collect();
+
+        for _ in 0..3000 {
+            let mut input: Vec<u8> = match rng.below(5) {
+                // Pure random bytes.
+                0 => (0..rng.below(3000)).map(|_| rng.next() as u8).collect(),
+                // A valid frame with 1..8 bytes flipped (incl. the length
+                // field and the type byte).
+                1 => {
+                    let mut b = valid[rng.below(valid.len())].clone();
+                    for _ in 0..1 + rng.below(8) {
+                        if !b.is_empty() {
+                            let i = rng.below(b.len());
+                            b[i] ^= 1 << rng.below(8);
+                        }
+                    }
+                    b
+                }
+                // A valid frame truncated at a random point.
+                2 => {
+                    let b = &valid[rng.below(valid.len())];
+                    b[..rng.below(b.len() + 1)].to_vec()
+                }
+                // A valid frame whose length field is replaced by a random
+                // u32 (incl. 0, huge values, and lengths just over 16 MiB).
+                3 => {
+                    let mut b = valid[rng.below(valid.len())].clone();
+                    if b.len() >= 4 {
+                        let len = match rng.below(4) {
+                            0 => 0,
+                            1 => 16 * 1024 * 1024 + 1,
+                            2 => u32::MAX,
+                            _ => rng.next() as u32,
+                        };
+                        b[..4].copy_from_slice(&len.to_be_bytes());
+                    }
+                    b
+                }
+                // Two valid frames with random garbage spliced between them.
+                _ => {
+                    let mut b = valid[rng.below(valid.len())].clone();
+                    b.extend((0..rng.below(64)).map(|_| rng.next() as u8));
+                    b.extend_from_slice(&valid[rng.below(valid.len())]);
+                    b
+                }
+            };
+            // Occasionally append a random tail so a trailing partial frame
+            // is exercised too.
+            if rng.below(3) == 0 {
+                input.extend((0..rng.below(32)).map(|_| rng.next() as u8));
+            }
+            let mut r = FrameReader::new();
+            let mut pos = 0;
+            while pos < input.len() {
+                let step = if rng.below(4) == 0 { 1 } else { 1 + rng.below(64) };
+                let end = (pos + step).min(input.len());
+                r.feed(&input[pos..end]);
+                pos = end;
+                // Drain whatever complete frames are available; an error
+                // ends this input (the reader keeps the bad bytes buffered,
+                // so re-calling would just error again).
+                loop {
+                    match r.next_frame() {
+                        Ok(Some(_)) => continue,
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn oversized_frame_length_is_rejected() {
         let mut r = FrameReader::new();
         // A header claiming a 64 MiB body must error, not allocate/wait.

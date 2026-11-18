@@ -10,6 +10,9 @@
 #   check 2  DNS interception: a query dialed to 203.0.113.53 is answered
 #            by the phone-side resolver instead
 #   check 3  the phone's arm switch: unarmed phone refuses the session
+#   check 4  two concurrent flows to the same destination both complete
+#   check 5  a 1 MiB body arrives byte for byte
+#   check 6  an unread flow flooded past the 4 MiB cap is reset
 #
 # No TUN device is needed, so this runs in sandboxes and CI where
 # CAP_NET_ADMIN is unavailable. For the same path over a real TUN device
