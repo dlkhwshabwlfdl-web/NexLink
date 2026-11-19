@@ -313,6 +313,117 @@ Persistent Routes:
         ));
     }
 
+    // A complete, realistic `route print -4` from a machine where the
+    // NexLink adapter does not exist at all (e.g. the Wintun install
+    // failed, or verification runs before the adapter is created).
+    // Verification of the tunnel routes must fail on every check.
+    const ROUTES_NO_ADAPTER: &str = r"===========================================================================
+Interface List
+  9...a4 b1 c5 d2 e3 f6 ......Intel(R) Wi-Fi 6 AX201 160MHz
+  1...........................Software Loopback Interface 1
+===========================================================================
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0      192.168.1.1   192.168.1.100     25
+        127.0.0.0        255.0.0.0         On-link         127.0.0.1    331
+      192.168.1.0    255.255.255.0         On-link     192.168.1.100    281
+    192.168.1.100  255.255.255.255         On-link     192.168.1.100    281
+===========================================================================
+Persistent Routes:
+  None
+";
+
+    #[test]
+    fn verification_fails_when_adapter_absent() {
+        let rows = parse_route_table(ROUTES_NO_ADAPTER);
+        let mask = Ipv4Addr::new(128, 0, 0, 0);
+        let gw = Ipv4Addr::new(10, 77, 0, 1);
+        let iface = Ipv4Addr::new(10, 77, 0, 2);
+        // Neither /1 half of the tunnel override is bound to our adapter.
+        assert!(!route_bound_to(&rows, Ipv4Addr::new(0, 0, 0, 0), mask, gw, iface));
+        assert!(!route_bound_to(&rows, Ipv4Addr::new(128, 0, 0, 0), mask, gw, iface));
+        // And no row in the table even mentions the adapter's address.
+        assert!(rows.iter().all(|r| r.interface != iface));
+        // The pre-existing LAN default is still parsed correctly, so an
+        // install() on this machine would find the gateway to preserve.
+        assert_eq!(
+            parse_default_gateway(ROUTES_NO_ADAPTER),
+            Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
+    }
+
+    // The v0.2.1 failure shape, in the table itself: both /1 routes via
+    // the tunnel gateway exist, but they are bound to the Wi-Fi
+    // interface — `route add` "succeeded" onto the wrong adapter.
+    // Verification against the NexLink interface must fail.
+    const ROUTES_WRONG_INTERFACE: &str = r"===========================================================================
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0        128.0.0.0        10.77.0.1   192.168.1.100       1
+        128.0.0.0        128.0.0.0        10.77.0.1   192.168.1.100       1
+          0.0.0.0          0.0.0.0      192.168.1.1   192.168.1.100      25
+          0.0.0.0          0.0.0.0        10.77.0.1       10.77.0.2     281
+===========================================================================
+Persistent Routes:
+  None
+";
+
+    #[test]
+    fn verification_fails_when_slash1_routes_bound_elsewhere() {
+        let rows = parse_route_table(ROUTES_WRONG_INTERFACE);
+        let mask = Ipv4Addr::new(128, 0, 0, 0);
+        let gw = Ipv4Addr::new(10, 77, 0, 1);
+        let iface = Ipv4Addr::new(10, 77, 0, 2);
+        assert!(!route_bound_to(&rows, Ipv4Addr::new(0, 0, 0, 0), mask, gw, iface));
+        assert!(!route_bound_to(&rows, Ipv4Addr::new(128, 0, 0, 0), mask, gw, iface));
+        // Sanity: the rows really are in the table — bound to Wi-Fi.
+        assert!(route_bound_to(
+            &rows,
+            Ipv4Addr::new(0, 0, 0, 0),
+            mask,
+            gw,
+            Ipv4Addr::new(192, 168, 1, 100)
+        ));
+    }
+
+    // Positive control on a full realistic table: a healthy install
+    // (both /1s on the adapter, the LAN default untouched, the
+    // adapter's own /24 on-link) must pass verification.
+    const ROUTES_HEALTHY_FULL: &str = r"===========================================================================
+Interface List
+ 12...00 ff 4e 65 784c ......NexLink Tunnel
+  9...a4 b1 c5 d2 e3 f6 ......Intel(R) Wi-Fi 6 AX201 160MHz
+  1...........................Software Loopback Interface 1
+===========================================================================
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0        128.0.0.0        10.77.0.1       10.77.0.2       1
+        128.0.0.0        128.0.0.0        10.77.0.1       10.77.0.2       1
+          0.0.0.0          0.0.0.0      192.168.1.1   192.168.1.100      25
+         10.77.0.0    255.255.255.0         On-link         10.77.0.2     256
+        127.0.0.0        255.0.0.0         On-link         127.0.0.1    331
+      192.168.1.0    255.255.255.0         On-link     192.168.1.100    281
+===========================================================================
+Persistent Routes:
+  None
+";
+
+    #[test]
+    fn verification_passes_on_healthy_full_table() {
+        let rows = parse_route_table(ROUTES_HEALTHY_FULL);
+        let mask = Ipv4Addr::new(128, 0, 0, 0);
+        let gw = Ipv4Addr::new(10, 77, 0, 1);
+        let iface = Ipv4Addr::new(10, 77, 0, 2);
+        assert!(route_bound_to(&rows, Ipv4Addr::new(0, 0, 0, 0), mask, gw, iface));
+        assert!(route_bound_to(&rows, Ipv4Addr::new(128, 0, 0, 0), mask, gw, iface));
+    }
+
     const INTERFACES: &str = r"Idx     Met         MTU          State                Name
 ---  ----------  ----------  ------------  ---------------------------
   1          75  4294967295  connected    Loopback Pseudo-Interface 1
@@ -325,6 +436,15 @@ Persistent Routes:
         assert_eq!(parse_interface_index(INTERFACES, "NexLink"), Some(12));
         assert_eq!(parse_interface_index(INTERFACES, "Wi-Fi"), Some(9));
         assert_eq!(parse_interface_index(INTERFACES, "Ethernet"), None);
+    }
+
+    #[test]
+    fn interface_index_absent_adapter() {
+        // No NexLink row at all: the adapter was never created, so
+        // there is no index to hand to `route add` — None, not a
+        // fallback to some other interface.
+        let out = "Idx     Met         MTU          State                Name\n---  ----------  ----------  ------------  ---------------------------\n  1          75  4294967295  connected    Loopback Pseudo-Interface 1\n  9          35        1500  connected    Wi-Fi\n";
+        assert_eq!(parse_interface_index(out, "NexLink"), None);
     }
 
     #[test]

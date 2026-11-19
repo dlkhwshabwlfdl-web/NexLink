@@ -168,6 +168,24 @@ enum ProbeEvent {
     Timeout,
 }
 
+/// Phone -> app backlog per flow at which read_link pauses and lets the
+/// stack drain (backpressure) instead of accepting more link data.
+const PENDING_HIGH_WATER: usize = 4 * 1024 * 1024;
+/// How long a flow's backlog may sit at the high-water mark with ZERO
+/// drain progress before the flow is reset. This is what bounds memory
+/// for an app that never reads: backpressure alone would pin the
+/// backlog at the high-water mark forever. A flow that is draining at
+/// any speed refreshes its progress timestamp on every flush and is
+/// never reset — the pre-v0.3.1 behaviour (reset the instant the cap
+/// was crossed) could not tell the two apart and killed every bulk
+/// transfer over the cap.
+const PENDING_STALL_RESET: Duration = Duration::from_secs(10);
+/// Last-resort backlog bound, far above anything backpressure allows in
+/// practice (~high-water + one read chunk). Only a wedged app that never
+/// drains can reach it; the flow is then reset — and the reset now
+/// actually reaches the app (see `rst_pending`).
+const PENDING_HARD_CAP: usize = 16 * 1024 * 1024;
+
 struct TcpFlow {
     handle: SocketHandle,
     tuple: (Ipv4Address, u16, Ipv4Address, u16), // src ip, src port, dst ip, dst port
@@ -180,6 +198,22 @@ struct TcpFlow {
     /// tail of the stream whenever Data and Close arrive in one batch.
     fin_from_phone: bool,
     fin_sent: bool,
+    /// The phone reset this flow (Close RST / OpenErr) or the backlog hard
+    /// cap fired. The stack socket is NOT torn down here: smoltcp emits
+    /// the RST to the app from a Closed socket on the next iface poll, so
+    /// service_flows aborts the socket and the sweep removes it one pass
+    /// later. (Aborting + removing in the frame handler, as before, ate
+    /// the RST entirely — the app hung on a phantom connection.)
+    rst_pending: bool,
+    /// Last time the flush moved at least one byte from `pending` into
+    /// the stack socket. Drives the stall reset (PENDING_STALL_RESET).
+    last_progress: StdInstant,
+}
+
+impl TcpFlow {
+    fn pending_len(&self) -> usize {
+        self.pending.iter().map(|d| d.len()).sum()
+    }
 }
 
 struct UdpFlow {
@@ -555,7 +589,7 @@ impl Engine {
         let flow = self.next_flow;
         self.next_flow += 1;
         crate::nxlog(format!("open tcp flow {flow}: {src}:{sport} -> {dst}:{dport}"));
-        self.tcp_flows.insert(flow, TcpFlow { handle, tuple, open: false, pending: VecDeque::new(), fin_to_phone: false, fin_from_phone: false, fin_sent: false });
+        self.tcp_flows.insert(flow, TcpFlow { handle, tuple, open: false, pending: VecDeque::new(), fin_to_phone: false, fin_from_phone: false, fin_sent: false, rst_pending: false, last_progress: StdInstant::now() });
         self.tcp_by_tuple.insert(tuple, flow);
         let _ = (src, sport);
         self.queue_frame(&Frame::Open { flow, proto: PROTO_TCP, ip: dst.octets(), port: dport });
@@ -609,6 +643,17 @@ impl Engine {
         let mut chunk = [0u8; 64 * 1024];
         let mut any = false;
         loop {
+            // Backpressure: once a flow's phone -> app backlog reaches
+            // the high-water mark, stop reading the link and let the
+            // stack drain the backlog first. The unread bytes stay in
+            // the link socket's receive buffer, so ordinary TCP flow
+            // control throttles the phone. (Resetting the flow here, as
+            // the old cap did, killed every bulk transfer whose sender
+            // burst past the cap faster than the app drained — i.e.
+            // every download over ~4 MiB on a fast link.)
+            if self.tcp_flows.values().any(|f| f.pending_len() >= PENDING_HIGH_WATER) {
+                break;
+            }
             match self.link.read(&mut chunk) {
                 Ok(0) => {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "phone closed the link"));
@@ -638,11 +683,12 @@ impl Engine {
             }
             Frame::OpenErr { flow, code } => {
                 crate::nxlog(format!("open-err flow {flow} code {code}"));
-                if let Some(f) = self.tcp_flows.remove(&flow) {
-                    self.tcp_by_tuple.remove(&f.tuple);
-                    let socket = self.sockets.get_mut::<tcp::Socket>(f.handle);
-                    socket.abort();
-                    self.sockets.remove(f.handle);
+                if let Some(f) = self.tcp_flows.get_mut(&flow) {
+                    // The phone could not open the destination: reset the
+                    // app-side connection so the app sees a refusal
+                    // instead of hanging (deferred teardown, see
+                    // rst_pending).
+                    f.rst_pending = true;
                 } else if let Some(f) = self.udp_flows.remove(&flow) {
                     self.udp_by_key.remove(&f.key);
                     self.sockets.remove(f.handle);
@@ -650,22 +696,20 @@ impl Engine {
             }
             Frame::Data { flow, data } => {
                 self.counters.down.fetch_add(data.len() as u64, Ordering::Relaxed);
-                // Cap the phone -> app backlog per flow: a phone that sends
-                // faster than the app reads must not grow memory without
-                // bound. Past 4 MiB the flow is reset on both sides.
-                const MAX_PENDING: usize = 4 * 1024 * 1024;
+                // Backstop for the read_link backpressure: the backlog
+                // can only approach this bound if the app never drains,
+                // in which case the flow is reset (deferred teardown —
+                // the sweep tells the phone, service_flows makes sure
+                // the app actually sees the RST).
                 let over_cap = match self.tcp_flows.get(&flow) {
-                    Some(f) => f.pending.iter().map(|d| d.len()).sum::<usize>() + data.len() > MAX_PENDING,
+                    Some(f) => f.pending_len() + data.len() > PENDING_HARD_CAP,
                     None => false,
                 };
                 if over_cap {
-                    if let Some(f) = self.tcp_flows.remove(&flow) {
-                        self.tcp_by_tuple.remove(&f.tuple);
-                        let socket = self.sockets.get_mut::<tcp::Socket>(f.handle);
-                        socket.abort();
-                        self.sockets.remove(f.handle);
+                    if let Some(f) = self.tcp_flows.get_mut(&flow) {
+                        f.pending.clear();
+                        f.rst_pending = true;
                     }
-                    self.queue_frame(&Frame::Close { flow, flags: CLOSE_RST });
                     return;
                 }
                 if let Some(f) = self.tcp_flows.get_mut(&flow) {
@@ -679,11 +723,10 @@ impl Engine {
             }
             Frame::Close { flow, flags } => {
                 if flags & CLOSE_RST != 0 {
-                    if let Some(f) = self.tcp_flows.remove(&flow) {
-                        self.tcp_by_tuple.remove(&f.tuple);
-                        let socket = self.sockets.get_mut::<tcp::Socket>(f.handle);
-                        socket.abort();
-                        self.sockets.remove(f.handle);
+                    if let Some(f) = self.tcp_flows.get_mut(&flow) {
+                        // Deferred teardown (see rst_pending): the app
+                        // must observe this reset, not a silent freeze.
+                        f.rst_pending = true;
                     }
                 } else if let Some(f) = self.tcp_flows.get_mut(&flow) {
                     // Phone sent everything and half-closed its side. Only
@@ -706,11 +749,31 @@ impl Engine {
 
     fn service_flows(&mut self) -> bool {
         let mut work = false;
-        let mut dead_tcp: Vec<u32> = Vec::new();
         let mut frames: Vec<Frame> = Vec::new();
+
+        // Flows whose stack socket was already Closed when this pass
+        // began. A socket aborted during THIS pass (rst_pending below)
+        // must survive until the next iface poll has emitted its RST to
+        // the app, so teardown is decided from this snapshot, never from
+        // a state observed mid-pass.
+        let closed_at_start: Vec<u32> = self
+            .tcp_flows
+            .iter()
+            .filter(|(_, f)| self.sockets.get::<tcp::Socket>(f.handle).state() == tcp::State::Closed)
+            .map(|(id, _)| *id)
+            .collect();
 
         for (id, f) in self.tcp_flows.iter_mut() {
             let socket = self.sockets.get_mut::<tcp::Socket>(f.handle);
+            // A reset from the phone (or the backlog hard cap): abort the
+            // stack socket so the app observes a reset; the sweep below
+            // removes the flow on the next pass, after a poll has had
+            // its chance to put the RST on the wire.
+            if f.rst_pending {
+                socket.abort();
+                work = true;
+                continue;
+            }
             // Flush phone -> app bytes.
             while let Some(data) = f.pending.front() {
                 if !socket.can_send() {
@@ -719,9 +782,13 @@ impl Engine {
                 match socket.send_slice(data) {
                     Ok(n) if n == data.len() => {
                         f.pending.pop_front();
+                        f.last_progress = StdInstant::now();
                         work = true;
                     }
                     Ok(n) => {
+                        if n > 0 {
+                            f.last_progress = StdInstant::now();
+                        }
                         let rest = data[n..].to_vec();
                         f.pending.pop_front();
                         f.pending.push_front(rest);
@@ -731,6 +798,22 @@ impl Engine {
                     Err(_) => break,
                 }
             }
+            // Stall reset: the backlog is pinned at the high-water mark
+            // and has made no drain progress for PENDING_STALL_RESET —
+            // the app is not reading. Reset the flow (deferred teardown)
+            // so the pinned memory is freed and both sides learn the
+            // flow is gone, instead of backpressuring it forever.
+            if f.pending_len() >= PENDING_HIGH_WATER
+                && f.last_progress.elapsed() > PENDING_STALL_RESET
+            {
+                crate::nxlog(format!(
+                    "tcp flow {id}: no drain progress for {:?} with a full backlog — resetting",
+                    PENDING_STALL_RESET
+                ));
+                f.pending.clear();
+                f.rst_pending = true;
+                continue;
+            }
             // The phone's FIN goes to the app only after the last pending
             // byte; the app may still send afterwards (half-close).
             if f.fin_from_phone && f.pending.is_empty() && !f.fin_sent {
@@ -738,7 +821,11 @@ impl Engine {
                 f.fin_sent = true;
             }
             // App -> phone bytes (only once the phone confirmed the flow).
-            if f.open && socket.may_recv() {
+            // Deliberately NOT gated on may_recv(): it is false in
+            // CloseWait with a drained buffer, which would hide the app's
+            // FIN forever (recv_slice reports Finished exactly there) and
+            // the phone would never see the half-close.
+            if f.open {
                 let mut buf = [0u8; 16 * 1024];
                 loop {
                     match socket.recv_slice(&mut buf) {
@@ -759,11 +846,8 @@ impl Engine {
                     }
                 }
             }
-            if socket.state() == tcp::State::Closed {
-                dead_tcp.push(*id);
-            }
         }
-        for id in dead_tcp {
+        for id in closed_at_start {
             if let Some(f) = self.tcp_flows.remove(&id) {
                 self.tcp_by_tuple.remove(&f.tuple);
                 self.sockets.remove(f.handle);
