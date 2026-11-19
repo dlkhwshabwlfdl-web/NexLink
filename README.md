@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/nexlink-logo-256.png" alt="NexLink logo" width="128" />
+  <img src="assets/nexlink-logo-1024.png" alt="NexLink logo" width="128" />
 </p>
 
 # NexLink
