@@ -343,8 +343,10 @@ impl Engine {
         stop: &AtomicBool,
         on_stage: &mut dyn FnMut(ProbeStage),
     ) -> Result<(), String> {
-        self.probe_dns(stop, on_stage)?;
-        self.probe_traffic(stop, on_stage)?;
+        self.probe_dns(stop, on_stage)
+            .map_err(|e| prefix_stage("DNS check failed", e))?;
+        self.probe_traffic(stop, on_stage)
+            .map_err(|e| prefix_stage("Traffic check failed", e))?;
         Ok(())
     }
 
@@ -806,6 +808,18 @@ impl Engine {
     }
 }
 
+/// Guarantee a probe error names its stage, whatever layer produced
+/// it (a link error deep in the wait loop must still surface as e.g.
+/// "DNS check failed: …"). Cancellation is not a stage failure and
+/// passes through untouched.
+fn prefix_stage(label: &str, err: String) -> String {
+    if err.starts_with(label) || err == "Connection cancelled" {
+        err
+    } else {
+        format!("{label}: {err}")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Connect-probe DNS messages
 // ---------------------------------------------------------------------------
@@ -890,6 +904,24 @@ mod tests {
         assert!(!valid_dns_response(&response(0x4E58, 0x8180, 0), 0x4E58));
         // Truncated garbage.
         assert!(!valid_dns_response(&[0x4E, 0x58, 0x81], 0x4E58));
+    }
+
+    #[test]
+    fn stage_prefixing() {
+        assert_eq!(
+            prefix_stage("DNS check failed", "link error (reset)".to_string()),
+            "DNS check failed: link error (reset)"
+        );
+        // Already named: untouched.
+        assert_eq!(
+            prefix_stage("DNS check failed", "DNS check failed: no answer".to_string()),
+            "DNS check failed: no answer"
+        );
+        // Cancellation is not a stage failure.
+        assert_eq!(
+            prefix_stage("DNS check failed", "Connection cancelled".to_string()),
+            "Connection cancelled"
+        );
     }
 
     #[test]
