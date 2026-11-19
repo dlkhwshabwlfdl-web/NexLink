@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
 
-use nxcore::engine::{client_handshake, Engine};
+use nxcore::engine::{client_handshake, Engine, TrafficCounters};
 use nxcore::Ipv4Address;
 
 struct Args {
@@ -74,7 +74,7 @@ fn main() {
         std::process::exit(1);
     });
     run_ip(&["addr", "add", &format!("{}/24", args.addr), "dev", &args.tun]);
-    run_ip(&["link", "set", &args.tun, "up", "mtu", "1400"]);
+    run_ip(&["link", "set", &args.tun, "up", "mtu", &nxcore::LINK_MTU.to_string()]);
     eprintln!("nxpump: {} is up at {}/24", args.tun, args.addr);
 
     // Device pump threads: TUN <-> channels.
@@ -126,7 +126,8 @@ fn main() {
     }
 
     let gateway: Ipv4Address = args.gateway.parse().expect("gateway IP");
-    let mut engine = Engine::new(to_engine_rx, from_engine_tx, link, gateway).expect("engine init");
+    let mut engine = Engine::new(to_engine_rx, from_engine_tx, link, gateway, TrafficCounters::new())
+        .expect("engine init");
     println!("engine running");
     match engine.run(stop) {
         Ok(()) => println!("engine stopped"),

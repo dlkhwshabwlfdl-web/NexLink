@@ -20,11 +20,17 @@
 //!      since nothing lives at 203.0.113.53.
 //!   3. With the phone not armed, the handshake reports armed = false.
 //!   4. Two concurrent flows to the same destination both complete.
-//!   5. A 1 MiB body arrives byte for byte.
+//!   5. A 1 MiB body arrives byte for byte — with every engine → app
+//!      packet within the 1400-byte link MTU (the v0.2.1 regression:
+//!      the engine emitted 1500-byte packets into a 1400-MTU adapter
+//!      and Windows silently dropped all bulk data).
 //!   6. A TCP flow whose app never reads is reset by the engine when the
 //!      phone floods past the 4 MiB pending cap (the server holds the
 //!      connection open afterwards, so only the engine's RST can close
 //!      the app socket).
+//!   7. The connect probes pass: a real DNS query and a real TCP open
+//!      cross the tunnel and succeed before the engine starts (the
+//!      gate the tray app puts in front of "Connected").
 //!
 //! Exit code 0 = PASS, 1 = FAIL.
 
@@ -32,7 +38,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
@@ -43,7 +49,7 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 
-use nxcore::engine::{client_handshake, Engine};
+use nxcore::engine::{client_handshake, Engine, TrafficCounters};
 
 // ---------------------------------------------------------------------------
 // Channel device for the virtual app's stack.
@@ -52,6 +58,9 @@ use nxcore::engine::{client_handshake, Engine};
 struct ChanDevice {
     rx: Receiver<Vec<u8>>,
     tx: Sender<Vec<u8>>,
+    /// Largest packet ever received from the engine — the MTU
+    /// regression check (check 5) reads this.
+    max_rx: Arc<AtomicUsize>,
 }
 
 struct RxTok(Vec<u8>);
@@ -78,7 +87,10 @@ impl Device for ChanDevice {
 
     fn receive(&mut self, _ts: Instant) -> Option<(RxTok, TxTok)> {
         match self.rx.try_recv() {
-            Ok(pkt) => Some((RxTok(pkt), TxTok(self.tx.clone()))),
+            Ok(pkt) => {
+                self.max_rx.fetch_max(pkt.len(), Ordering::Relaxed);
+                Some((RxTok(pkt), TxTok(self.tx.clone())))
+            }
             Err(_) => None,
         }
     }
@@ -90,7 +102,9 @@ impl Device for ChanDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
-        caps.max_transmission_unit = 1500;
+        // The virtual adapter is constrained to the shared link MTU,
+        // exactly like the real Wintun adapter (see nxcore::LINK_MTU).
+        caps.max_transmission_unit = nxcore::LINK_MTU;
         caps
     }
 }
@@ -238,6 +252,7 @@ fn start_simphone(armed: bool) -> Child {
     let mut cmd = Command::new(simphone_path());
     cmd.arg("--listen").arg("127.0.0.1:47778")
         .arg("--map").arg("203.0.113.7:18080=127.0.0.1:18080")
+        .arg("--map").arg("1.1.1.1:443=127.0.0.1:18080")
         .arg("--dns").arg("127.0.0.1:15353")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit());
@@ -319,20 +334,48 @@ fn main() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let engine_stop = stop.clone();
+    let (probe_tx, probe_rx) = channel::<Result<(), String>>();
     let engine_thread = std::thread::spawn(move || {
-        let mut engine = Engine::new(engine_in_rx, engine_out_tx, link, Ipv4Address::new(10, 77, 0, 1))
-            .expect("engine init");
-        let _ = engine.run(engine_stop);
+        let mut engine = Engine::new(
+            engine_in_rx,
+            engine_out_tx,
+            link,
+            Ipv4Address::new(10, 77, 0, 1),
+            TrafficCounters::new(),
+        )
+        .expect("engine init");
+        // Check 7 runs here: the same probes the tray app gates
+        // "Connected" on, before the engine's main loop starts.
+        let probe = engine.run_probes(&engine_stop, &mut |stage| {
+            eprintln!("e2e: probe stage {stage:?}");
+        });
+        let _ = probe_tx.send(probe.clone());
+        if probe.is_ok() {
+            let _ = engine.run(engine_stop);
+        }
     });
 
     // The virtual PC app: its own stack at 10.77.0.2.
-    let mut app_dev = ChanDevice { rx: app_in_rx, tx: app_out_tx };
+    let app_max_rx = Arc::new(AtomicUsize::new(0));
+    let mut app_dev = ChanDevice { rx: app_in_rx, tx: app_out_tx, max_rx: app_max_rx.clone() };
     let mut app_iface = Interface::new(Config::new(HardwareAddress::Ip), &mut app_dev, Instant::now());
     app_iface.update_ip_addrs(|addrs| {
         let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 77, 0, 2)), 24));
     });
     app_iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(10, 77, 0, 1)).unwrap();
     let mut sockets = SocketSet::new(vec![]);
+
+    // -- Check 7: the connect probes ----------------------------------------
+    // A real DNS query (answered by the phone-side interception) and a
+    // real TCP open to 1.1.1.1:443 (mapped to the local HTTP server)
+    // must both succeed before the engine starts serving traffic.
+    match probe_rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(Ok(())) => {
+            println!("check 7 OK: connect probes verified DNS and traffic through the tunnel")
+        }
+        Ok(Err(e)) => fail(&format!("probe check: {e}")),
+        Err(_) => fail("probe check: probes did not finish within 30 s"),
+    }
 
     // -- Check 1: HTTP through the tunnel ----------------------------------
     let mut tcp_sock = tcp::Socket::new(
@@ -532,6 +575,26 @@ fn main() {
         ));
     }
     println!("check 5 OK: 1 MiB transferred through the tunnel byte for byte");
+
+    // -- Check 5b: the MTU regression ---------------------------------------
+    // The 1 MiB body crossed in full-size segments (the HTTP server
+    // writes 64 KiB chunks; the stacks segment them). Every packet the
+    // engine emitted toward the app must fit the 1400-byte link MTU —
+    // at the v0.2.1 engine MTU of 1500 the largest packets would be
+    // 1500 bytes and a real 1400-MTU adapter would drop them all.
+    let max_pkt = app_max_rx.load(Ordering::Relaxed);
+    if max_pkt > nxcore::LINK_MTU {
+        fail(&format!(
+            "MTU check: engine emitted a {max_pkt}-byte packet, over the {}-byte link MTU",
+            nxcore::LINK_MTU
+        ));
+    }
+    if max_pkt < 1300 {
+        fail(&format!(
+            "MTU check: largest engine -> app packet was only {max_pkt} bytes — no full-size segments flowed, so the regression is not exercised"
+        ));
+    }
+    println!("check 5b OK: largest engine -> app packet {max_pkt} bytes (link MTU {})", nxcore::LINK_MTU);
 
     // -- Check 6: unread flow flooded past the 4 MiB cap is reset --------
     // The app opens a flow, asks for 6 MiB, and then never reads a byte.

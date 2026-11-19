@@ -54,9 +54,11 @@ pub const ADAPTER_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 /// The phone side of the tunnel. The engine also uses it as its default
 /// route ("routed locally" — see `nxcore::engine::Engine::new`).
 pub const GATEWAY_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 1);
-/// MTU of the virtual adapter. 1400 leaves headroom for the NXLP/TCP
-/// encapsulation between the PC and the phone.
-pub const ADAPTER_MTU: usize = 1400;
+/// MTU of the virtual adapter — the shared link MTU from nxcore, so
+/// the adapter and the engine's stack can never disagree again (the
+/// 1500/1400 split was the v0.2.1 no-traffic bug). 1400 leaves
+/// headroom for the NXLP/TCP encapsulation between PC and phone.
+pub const ADAPTER_MTU: usize = nxcore::LINK_MTU;
 /// Ring buffer size per direction. Must be a power of two between
 /// `wintun::MIN_RING_CAPACITY` (128 KiB) and `wintun::MAX_RING_CAPACITY`
 /// (64 MiB); 4 MiB holds ~2800 full-size packets per direction.

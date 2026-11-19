@@ -100,6 +100,18 @@ a few bytes of framing per chunk.
   toggle, Exit.
 - **Manual connect only (product rule):** the app never retries in a loop.
   Connect is a button press; a failed attempt reports once and stops.
+- **Verified connect (v0.3.0):** "Connected" is gated on end-to-end probes
+  through the tunnel itself — a DNS query answered via the phone's
+  interception, then a TCP open the phone completes — with named failure
+  stages ("DNS check failed", "Traffic check failed"). The /1 routes are
+  bound to the adapter's interface index and read back from the live route
+  table after install; the adapter's DNS is read back too. The status line
+  shows live byte counters, a USB tunnel's `adb forward` is supervised for
+  its whole life, and every run logs to `%APPDATA%/NexLink/nexlink.log`.
+  The whole data path shares one MTU (`nxcore::LINK_MTU`, 1400) — the
+  v0.2.1 engine/adapter MTU split (1500 vs 1400) silently dropped all bulk
+  traffic while reporting "Connected", which is what these gates exist to
+  make impossible.
 - Creating the adapter and changing routes needs elevation; the app asks for
   UAC once when connecting.
 

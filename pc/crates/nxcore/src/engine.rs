@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
@@ -79,7 +79,10 @@ impl Device for ChanDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
-        caps.max_transmission_unit = 1500;
+        // The shared link MTU — must match the Wintun adapter exactly
+        // (see `crate::LINK_MTU`; the 1500/1400 split was the v0.2.1
+        // "Connected but nothing loads" bug).
+        caps.max_transmission_unit = crate::LINK_MTU;
         caps
     }
 }
@@ -126,6 +129,45 @@ pub fn client_handshake(stream: &mut TcpStream, client_name: &str) -> io::Result
 // Engine
 // ---------------------------------------------------------------------------
 
+/// Live count of user DATA bytes that crossed the tunnel, shared with
+/// whoever runs the engine (the tray app shows them in its status line;
+/// a "Connected" with both counters stuck at zero is exactly the
+/// failure v0.2.1 hid). `up` = PC → phone, `down` = phone → PC.
+/// Handshake, keepalive and connect-probe bytes are not counted — only
+/// payload of flows the stack serviced.
+#[derive(Clone, Default)]
+pub struct TrafficCounters {
+    pub up: Arc<AtomicU64>,
+    pub down: Arc<AtomicU64>,
+}
+
+impl TrafficCounters {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// (down, up) snapshot.
+    pub fn snapshot(&self) -> (u64, u64) {
+        (self.down.load(Ordering::Relaxed), self.up.load(Ordering::Relaxed))
+    }
+}
+
+/// The two connect-probe stages, in order. The app maps these to its
+/// "Verifying DNS…" / "Verifying traffic…" status texts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeStage {
+    Dns,
+    Traffic,
+}
+
+enum ProbeEvent {
+    OpenOk,
+    OpenErr(u8),
+    Data(Vec<u8>),
+    Closed,
+    Timeout,
+}
+
 struct TcpFlow {
     handle: SocketHandle,
     tuple: (Ipv4Address, u16, Ipv4Address, u16), // src ip, src port, dst ip, dst port
@@ -164,6 +206,7 @@ pub struct Engine {
     last_ping: StdInstant,
     last_rx: StdInstant,
     last_debug_dump: StdInstant,
+    counters: TrafficCounters,
 }
 
 impl Engine {
@@ -175,6 +218,7 @@ impl Engine {
         dev_tx: Sender<Vec<u8>>,
         link: TcpStream,
         gateway: Ipv4Address,
+        counters: TrafficCounters,
     ) -> io::Result<Engine> {
         link.set_nonblocking(true)?;
         let queue: SharedQueue = Rc::new(RefCell::new(VecDeque::new()));
@@ -208,6 +252,7 @@ impl Engine {
             last_ping: StdInstant::now(),
             last_rx: StdInstant::now(),
             last_debug_dump: StdInstant::now(),
+            counters,
         };
         Ok(engine)
     }
@@ -245,7 +290,7 @@ impl Engine {
                 self.last_debug_dump = StdInstant::now();
                 for (id, f) in self.tcp_flows.iter() {
                     let socket = self.sockets.get::<tcp::Socket>(f.handle);
-                    crate::nxlog(format!(
+                    crate::nxdebug(format!(
                         "tcp flow {id}: tuple={:?} state={:?} open={}",
                         f.tuple,
                         socket.state(),
@@ -254,7 +299,7 @@ impl Engine {
                 }
                 for (id, f) in self.udp_flows.iter() {
                     let socket = self.sockets.get::<udp::Socket>(f.handle);
-                    crate::nxlog(format!(
+                    crate::nxdebug(format!(
                         "udp flow {id}: endpoint={:?} can_recv={} recv_queue={}",
                         socket.endpoint(),
                         socket.can_recv(),
@@ -279,6 +324,192 @@ impl Engine {
         Ok(())
     }
 
+    // -- connect probes -----------------------------------------------------
+    //
+    // "Connected" is gated on traffic, not on the handshake (the PdaNet
+    // lesson; v0.2.1 asserted Connected after thread spawn and a dead
+    // data path looked identical to a working one). Before `run`, the
+    // caller drives these probes over the engine's own flow machinery:
+    // a real DNS query through the phone's interception, and a real TCP
+    // open the phone must complete. A failure names its stage.
+
+    /// One end-to-end verification through the tunnel, run on the
+    /// handshaken link before the main loop starts. `on_stage` is
+    /// called as each stage begins (the app turns it into its
+    /// "Verifying DNS…" / "Verifying traffic…" status text). Errors
+    /// are complete user-facing messages prefixed with the stage name.
+    pub fn run_probes(
+        &mut self,
+        stop: &AtomicBool,
+        on_stage: &mut dyn FnMut(ProbeStage),
+    ) -> Result<(), String> {
+        self.probe_dns(stop, on_stage)?;
+        self.probe_traffic(stop, on_stage)?;
+        Ok(())
+    }
+
+    fn alloc_flow(&mut self) -> u32 {
+        let flow = self.next_flow;
+        self.next_flow += 1;
+        flow
+    }
+
+    fn probe_dns(
+        &mut self,
+        stop: &AtomicBool,
+        on_stage: &mut dyn FnMut(ProbeStage),
+    ) -> Result<(), String> {
+        on_stage(ProbeStage::Dns);
+        crate::nxlog("probe: DNS check — querying example.com via 8.8.8.8:53".to_string());
+        // Any fixed id works; the response must echo it.
+        let txid: u16 = 0x4E58;
+        let flow = self.alloc_flow();
+        self.queue_frame(&Frame::Open { flow, proto: PROTO_UDP, ip: [8, 8, 8, 8], port: 53 });
+        self.queue_frame(&Frame::Data { flow, data: build_dns_query(txid) });
+        self.flush_link()
+            .map_err(|e| format!("DNS check failed: could not send the test query ({e})"))?;
+        let deadline = StdInstant::now() + Duration::from_secs(12);
+        loop {
+            match self.wait_probe_event(stop, flow, deadline)? {
+                ProbeEvent::Data(data) => {
+                    if valid_dns_response(&data, txid) {
+                        crate::nxlog(format!(
+                            "probe: DNS check OK ({}-byte answer)",
+                            data.len()
+                        ));
+                        self.queue_frame(&Frame::Close { flow, flags: CLOSE_FIN });
+                        let _ = self.flush_link();
+                        return Ok(());
+                    }
+                    // Not our answer (or a malformed one): keep waiting
+                    // until the deadline — the real one may follow.
+                }
+                ProbeEvent::OpenOk => {}
+                ProbeEvent::OpenErr(code) => {
+                    return Err(format!(
+                        "DNS check failed: the phone refused the test DNS flow (error {code})"
+                    ));
+                }
+                ProbeEvent::Closed => {
+                    return Err(
+                        "DNS check failed: the phone closed the test flow without answering"
+                            .to_string(),
+                    );
+                }
+                ProbeEvent::Timeout => {
+                    return Err(
+                        "DNS check failed: no answer came back through the phone within 12 seconds"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn probe_traffic(
+        &mut self,
+        stop: &AtomicBool,
+        on_stage: &mut dyn FnMut(ProbeStage),
+    ) -> Result<(), String> {
+        on_stage(ProbeStage::Traffic);
+        crate::nxlog("probe: traffic check — opening a TCP flow to 1.1.1.1:443".to_string());
+        let flow = self.alloc_flow();
+        self.queue_frame(&Frame::Open { flow, proto: PROTO_TCP, ip: [1, 1, 1, 1], port: 443 });
+        self.flush_link()
+            .map_err(|e| format!("Traffic check failed: could not open the test flow ({e})"))?;
+        // The phone's own connect timeout is 10 s; allow slack on top.
+        let deadline = StdInstant::now() + Duration::from_secs(15);
+        loop {
+            match self.wait_probe_event(stop, flow, deadline)? {
+                ProbeEvent::OpenOk => {
+                    crate::nxlog("probe: traffic check OK (phone connected to 1.1.1.1:443)".to_string());
+                    self.queue_frame(&Frame::Close { flow, flags: CLOSE_RST });
+                    let _ = self.flush_link();
+                    return Ok(());
+                }
+                ProbeEvent::OpenErr(code) => {
+                    return Err(format!(
+                        "Traffic check failed: the phone could not connect to 1.1.1.1:443 (error {code})"
+                    ));
+                }
+                ProbeEvent::Closed => {
+                    return Err(
+                        "Traffic check failed: the phone closed the test flow".to_string()
+                    );
+                }
+                ProbeEvent::Data(_) => {}
+                ProbeEvent::Timeout => {
+                    return Err(
+                        "Traffic check failed: the phone did not confirm a connection to 1.1.1.1:443 within 15 seconds"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Pump the link until one event for `flow` arrives or the deadline
+    /// passes. Frames for other flows cannot exist yet (the probes run
+    /// before any user flow), so anything else is answered if it needs
+    /// an answer (Ping → Pong) and otherwise dropped.
+    fn wait_probe_event(
+        &mut self,
+        stop: &AtomicBool,
+        flow: u32,
+        deadline: StdInstant,
+    ) -> Result<ProbeEvent, String> {
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return Err("Connection cancelled".to_string());
+            }
+            if StdInstant::now() >= deadline {
+                return Ok(ProbeEvent::Timeout);
+            }
+            match self.link.read(&mut chunk) {
+                Ok(0) => {
+                    return Err("the phone closed the link during verification".to_string());
+                }
+                Ok(n) => {
+                    self.last_rx = StdInstant::now();
+                    self.reader.feed(&chunk[..n]);
+                    while let Some(frame) = self
+                        .reader
+                        .next_frame()
+                        .map_err(|e| format!("verification failed: {e}"))?
+                    {
+                        match frame {
+                            Frame::Ping => {
+                                self.queue_frame(&Frame::Pong);
+                                self.flush_link()
+                                    .map_err(|e| format!("verification failed: {e}"))?;
+                            }
+                            Frame::OpenOk { flow: f } if f == flow => {
+                                return Ok(ProbeEvent::OpenOk);
+                            }
+                            Frame::OpenErr { flow: f, code } if f == flow => {
+                                return Ok(ProbeEvent::OpenErr(code));
+                            }
+                            Frame::Data { flow: f, data } if f == flow => {
+                                return Ok(ProbeEvent::Data(data));
+                            }
+                            Frame::Close { flow: f, .. } if f == flow => {
+                                return Ok(ProbeEvent::Closed);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => {
+                    return Err(format!("verification failed: link error ({e})"));
+                }
+            }
+        }
+    }
+
     // -- packet sniffing ----------------------------------------------------
 
     fn sniff(&mut self, pkt: &[u8]) {
@@ -298,7 +529,7 @@ impl Engine {
             IpProtocol::Udp => {
                 let Ok(udp_pkt) = UdpPacket::new_checked(ip.payload()) else { return };
                 let key = (src, udp_pkt.src_port(), dst, udp_pkt.dst_port());
-                crate::nxlog(format!("sniff udp {src}:{} -> {dst}:{}", key.1, key.3));
+                crate::nxdebug(format!("sniff udp {src}:{} -> {dst}:{}", key.1, key.3));
                 if !self.udp_by_key.contains_key(&key) {
                     self.open_udp_flow(key);
                 }
@@ -416,6 +647,7 @@ impl Engine {
                 }
             }
             Frame::Data { flow, data } => {
+                self.counters.down.fetch_add(data.len() as u64, Ordering::Relaxed);
                 // Cap the phone -> app backlog per flow: a phone that sends
                 // faster than the app reads must not grow memory without
                 // bound. Past 4 MiB the flow is reset on both sides.
@@ -440,7 +672,7 @@ impl Engine {
                     f.last_seen = StdInstant::now();
                     let socket = self.sockets.get_mut::<udp::Socket>(f.handle);
                     let r = socket.send_slice(&data, f.app);
-                    crate::nxlog(format!("udp flow {flow}: send_slice {} bytes to {} -> {r:?}", data.len(), f.app));
+                    crate::nxdebug(format!("udp flow {flow}: send_slice {} bytes to {} -> {r:?}", data.len(), f.app));
                 }
             }
             Frame::Close { flow, flags } => {
@@ -510,6 +742,7 @@ impl Engine {
                     match socket.recv_slice(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
+                            self.counters.up.fetch_add(n as u64, Ordering::Relaxed);
                             frames.push(Frame::Data { flow: *id, data: buf[..n].to_vec() });
                             work = true;
                         }
@@ -547,7 +780,8 @@ impl Engine {
         for (id, f) in self.udp_flows.iter_mut() {
             let socket = self.sockets.get_mut::<udp::Socket>(f.handle);
             while let Ok((data, _meta)) = socket.recv() {
-                crate::nxlog(format!("udp flow {id}: app packet {} bytes -> phone", data.len()));
+                crate::nxdebug(format!("udp flow {id}: app packet {} bytes -> phone", data.len()));
+                self.counters.up.fetch_add(data.len() as u64, Ordering::Relaxed);
                 frames.push(Frame::Data { flow: *id, data: data.to_vec() });
                 f.last_seen = StdInstant::now();
                 work = true;
@@ -569,5 +803,99 @@ impl Engine {
             self.queue_frame(&frame);
         }
         work
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connect-probe DNS messages
+// ---------------------------------------------------------------------------
+
+/// A minimal well-formed DNS query: `example.com`, type A, class IN,
+/// recursion desired. Sent through the phone's DNS interception by the
+/// DNS probe stage.
+fn build_dns_query(txid: u16) -> Vec<u8> {
+    let mut q = Vec::with_capacity(29);
+    q.extend_from_slice(&txid.to_be_bytes());
+    q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+    q.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    q.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    q.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    q.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    q.push(7);
+    q.extend_from_slice(b"example");
+    q.push(3);
+    q.extend_from_slice(b"com");
+    q.push(0);
+    q.extend_from_slice(&1u16.to_be_bytes()); // A
+    q.extend_from_slice(&1u16.to_be_bytes()); // IN
+    q
+}
+
+/// Is this a valid successful response to our probe query? Checks the
+/// header only: matching transaction id, QR set, no error rcode, and
+/// at least one answer — enough to prove a resolver at the far end of
+/// the tunnel actually resolved the name.
+fn valid_dns_response(resp: &[u8], txid: u16) -> bool {
+    if resp.len() < 12 {
+        return false;
+    }
+    if u16::from_be_bytes([resp[0], resp[1]]) != txid {
+        return false;
+    }
+    let flags = u16::from_be_bytes([resp[2], resp[3]]);
+    if flags & 0x8000 == 0 {
+        return false; // not a response
+    }
+    if flags & 0x000F != 0 {
+        return false; // rcode: an error, not an answer
+    }
+    u16::from_be_bytes([resp[6], resp[7]]) >= 1 // ANCOUNT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dns_query_is_well_formed() {
+        let q = build_dns_query(0x4E58);
+        assert_eq!(q.len(), 29);
+        assert_eq!(&q[0..2], &[0x4E, 0x58]);
+        assert_eq!(&q[12..25], &[7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0]);
+        assert_eq!(&q[25..29], &[0, 1, 0, 1]);
+    }
+
+    fn response(txid: u16, flags: u16, answers: u16) -> Vec<u8> {
+        let mut r = Vec::new();
+        r.extend_from_slice(&txid.to_be_bytes());
+        r.extend_from_slice(&flags.to_be_bytes());
+        r.extend_from_slice(&1u16.to_be_bytes());
+        r.extend_from_slice(&answers.to_be_bytes());
+        r.extend_from_slice(&0u16.to_be_bytes());
+        r.extend_from_slice(&0u16.to_be_bytes());
+        r
+    }
+
+    #[test]
+    fn dns_response_validation() {
+        // A normal NOERROR response with one answer.
+        assert!(valid_dns_response(&response(0x4E58, 0x8180, 1), 0x4E58));
+        // Wrong transaction id.
+        assert!(!valid_dns_response(&response(0x1234, 0x8180, 1), 0x4E58));
+        // A query, not a response (QR clear).
+        assert!(!valid_dns_response(&response(0x4E58, 0x0100, 0), 0x4E58));
+        // NXDOMAIN (rcode 3), no answers.
+        assert!(!valid_dns_response(&response(0x4E58, 0x8183, 0), 0x4E58));
+        // NOERROR but zero answers (NODATA) proves nothing.
+        assert!(!valid_dns_response(&response(0x4E58, 0x8180, 0), 0x4E58));
+        // Truncated garbage.
+        assert!(!valid_dns_response(&[0x4E, 0x58, 0x81], 0x4E58));
+    }
+
+    #[test]
+    fn link_mtu_is_1400() {
+        // The regression guard for the v0.2.1 bug: if this value ever
+        // drifts from the adapter's, bulk traffic silently dies again.
+        assert_eq!(crate::LINK_MTU, 1400);
     }
 }

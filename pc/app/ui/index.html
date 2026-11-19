@@ -63,13 +63,32 @@
 
 <script>
   const { invoke } = window.__TAURI__.core;
+  const { listen } = window.__TAURI__.event;
   const ip = document.getElementById('ip');
   const status = document.getElementById('status');
   const button = document.getElementById('connect');
   const autostart = document.getElementById('autostart');
   const radios = document.querySelectorAll('input[name=transport]');
   let connected = false;
+  let connecting = false;
   let pollTimer = null;
+
+  // The backend narrates the connect stages ("Opening the virtual
+  // adapter…", "Verifying DNS…", …) so the wait never looks frozen —
+  // and a failed stage arrives as the connect error itself.
+  listen('connect-stage', (e) => {
+    if (connecting && !connected) {
+      status.className = '';
+      status.textContent = e.payload;
+    }
+  });
+
+  function fmtBytes(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+    return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+  }
 
   // "Start with Windows": read the Run key once at startup, then save
   // on every toggle. On non-Windows builds the command fails and the
@@ -114,10 +133,21 @@
 
   // While connected, the engine thread may die on its own (link lost):
   // the backend tears the tunnel down itself, and this poll surfaces it.
+  // A live status also carries the engine's byte counters, shown in
+  // the status line — a connection that moves no bytes is visible at
+  // a glance instead of looking green forever.
   async function pollStatus() {
     try {
       const s = await invoke('tunnel_status');
-      if (s.startsWith('connected|')) return;
+      if (s.startsWith('connected|')) {
+        const parts = s.split('|');
+        if (parts.length >= 4) {
+          status.className = 'ok';
+          status.textContent = 'Connected (' + parts[1] + ') · ↓ ' +
+            fmtBytes(Number(parts[2])) + ' ↑ ' + fmtBytes(Number(parts[3]));
+        }
+        return;
+      }
       if (s.startsWith('dead|')) {
         showDisconnected('Connection lost: ' + s.slice(5) + ' Routes were removed automatically — press Connect to try again.', 'err');
       } else if (s.startsWith('disconnected|')) {
@@ -151,14 +181,17 @@
     }
     const transport = document.querySelector('input[name=transport]:checked').value;
     button.disabled = true;
+    connecting = true;
     status.className = '';
     status.textContent = 'Reaching your phone…';
     try {
       const msg = await invoke('connect', { transport, address: ip.value });
+      connecting = false;
       status.className = 'ok';
       status.textContent = msg;
       showConnected();
     } catch (e) {
+      connecting = false;
       status.className = 'err';
       status.textContent = String(e);
       button.disabled = false;

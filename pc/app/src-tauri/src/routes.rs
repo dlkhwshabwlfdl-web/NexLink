@@ -10,14 +10,21 @@
 //!
 //! All of it goes through the `route` / `netsh` command-line tools
 //! (`std::process`) — there is no stable Rust API for this — and both
-//! need the app to run elevated; see [`is_elevated`]. Only exit codes
-//! are trusted, never the (localized) command output.
+//! need the app to run elevated; see [`is_elevated`].
+//!
+//! Since v0.3.0 the /1 routes are added bound to the NexLink adapter's
+//! interface index, and installation ends with a read-back: the IPv4
+//! route table must show both /1s on the NexLink adapter and the
+//! adapter's DNS must read back as 10.77.0.1. v0.2.1 trusted exit codes
+//! alone and shipped a build whose "Connected" carried no traffic;
+//! success is now what Windows reports, not what the commands claimed.
 
 use std::net::Ipv4Addr;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use crate::netutil;
-use crate::wintun_backend::{ADAPTER_NAME, GATEWAY_ADDRESS};
+use crate::wintun_backend::{ADAPTER_ADDRESS, ADAPTER_NAME, GATEWAY_ADDRESS};
 
 /// Run a command, capturing its output; success is the exit code only.
 fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
@@ -47,37 +54,39 @@ struct AddedRoute {
     destination: Ipv4Addr,
     mask: Ipv4Addr,
     gateway: Ipv4Addr,
+    /// Bind the route to this interface index (`route add … if N`).
+    /// Always set for the tunnel /1s (they must land on the NexLink
+    /// adapter, nowhere else); unset for the Wi-Fi host route, whose
+    /// interface is the physical one and is picked by its gateway.
+    interface: Option<u32>,
 }
 
 impl AddedRoute {
     fn add(&self) -> Result<(), String> {
-        run(
-            "route",
-            &[
-                "add",
-                &self.destination.to_string(),
-                "mask",
-                &self.mask.to_string(),
-                &self.gateway.to_string(),
-                "metric",
-                "1",
-            ],
-        )
-        .map(|_| ())
+        let dest = self.destination.to_string();
+        let mask = self.mask.to_string();
+        let gateway = self.gateway.to_string();
+        let ifindex = self.interface.map(|i| i.to_string());
+        let mut args: Vec<&str> = vec!["add", &dest, "mask", &mask, &gateway, "metric", "1"];
+        if let Some(idx) = &ifindex {
+            args.push("if");
+            args.push(idx);
+        }
+        run("route", &args).map(|_| ())
     }
 
     /// Best effort: a missing route is not an error on the way out.
     fn delete(&self) {
-        let _ = run(
-            "route",
-            &[
-                "delete",
-                &self.destination.to_string(),
-                "mask",
-                &self.mask.to_string(),
-                &self.gateway.to_string(),
-            ],
-        );
+        let dest = self.destination.to_string();
+        let mask = self.mask.to_string();
+        let gateway = self.gateway.to_string();
+        let ifindex = self.interface.map(|i| i.to_string());
+        let mut args: Vec<&str> = vec!["delete", &dest, "mask", &mask, &gateway];
+        if let Some(idx) = &ifindex {
+            args.push("if");
+            args.push(idx);
+        }
+        let _ = run("route", &args);
     }
 }
 
@@ -120,10 +129,79 @@ pub fn physical_gateway() -> Result<Ipv4Addr, String> {
     })
 }
 
-/// Install the tunnel routes (and adapter DNS). On any failure the
-/// routes installed so far are removed again and the error is returned.
+/// The NexLink adapter's interface index, for `route add … if N`.
+/// The adapter was created moments ago by the Wintun backend; give
+/// Windows a few seconds to list it before giving up.
+fn adapter_interface_index() -> Result<u32, String> {
+    for attempt in 0..10 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        let out = run("netsh", &["interface", "ipv4", "show", "interfaces"])?;
+        if let Some(idx) = netutil::parse_interface_index(&out, ADAPTER_NAME) {
+            return Ok(idx);
+        }
+    }
+    Err(format!(
+        "Could not find the '{ADAPTER_NAME}' adapter in Windows' interface list — the adapter did not come up."
+    ))
+}
+
+/// Read back what `install` just did and prove it stuck: both /1
+/// routes bound to the NexLink adapter in the live route table, and
+/// the adapter's DNS set to the virtual gateway. One retry after a
+/// short pause covers slow route commits; after that, a mismatch is a
+/// hard, named failure.
+fn verify_install() -> Result<(), String> {
+    let mask = Ipv4Addr::new(128, 0, 0, 0);
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let table = run("route", &["print", "-4"])?;
+        let rows = netutil::parse_route_table(&table);
+        let mut unbound: Vec<Ipv4Addr> = Vec::new();
+        for destination in [Ipv4Addr::new(0, 0, 0, 0), Ipv4Addr::new(128, 0, 0, 0)] {
+            if !netutil::route_bound_to(&rows, destination, mask, GATEWAY_ADDRESS, ADAPTER_ADDRESS)
+            {
+                unbound.push(destination);
+            }
+        }
+        if !unbound.is_empty() {
+            if attempt == 0 {
+                continue;
+            }
+            let dest = unbound[0];
+            return Err(format!(
+                "Route check failed: {dest}/{mask} via {GATEWAY_ADDRESS} is not bound to the {ADAPTER_NAME} adapter ({ADAPTER_ADDRESS}) in the route table"
+            ));
+        }
+        let dns = run(
+            "netsh",
+            &["interface", "ipv4", "show", "dnsservers", &format!("name={ADAPTER_NAME}")],
+        )?;
+        if !netutil::dns_server_listed(&dns, GATEWAY_ADDRESS) {
+            if attempt == 0 {
+                continue;
+            }
+            return Err(format!(
+                "DNS check failed: the {ADAPTER_NAME} adapter's DNS server is not {GATEWAY_ADDRESS} after setting it"
+            ));
+        }
+        return Ok(());
+    }
+    unreachable!("the loop always returns")
+}
+
+/// Install the tunnel routes (and adapter DNS), then verify them by
+/// reading Windows' state back. On any failure the routes installed so
+/// far are removed again and the error is returned.
 pub fn install(transport: &str, phone_ip: Option<Ipv4Addr>) -> Result<TunnelRoutes, String> {
     let mut installed = TunnelRoutes { routes: Vec::new(), dns_set: false };
+
+    // The /1s are bound to the adapter by interface index, so the
+    // index is needed before anything is added.
+    let ifindex = adapter_interface_index()?;
 
     // Wi-Fi first: without the /32 host route, the link stream to the
     // phone would itself be routed into the tunnel and deadlock.
@@ -135,6 +213,7 @@ pub fn install(transport: &str, phone_ip: Option<Ipv4Addr>) -> Result<TunnelRout
             destination: ip,
             mask: Ipv4Addr::new(255, 255, 255, 255),
             gateway: gw,
+            interface: None,
         };
         // A crashed run may have left this route behind; clear it first.
         host.delete();
@@ -150,7 +229,8 @@ pub fn install(transport: &str, phone_ip: Option<Ipv4Addr>) -> Result<TunnelRout
         (Ipv4Addr::new(0, 0, 0, 0), Ipv4Addr::new(128, 0, 0, 0)),
         (Ipv4Addr::new(128, 0, 0, 0), Ipv4Addr::new(128, 0, 0, 0)),
     ] {
-        let route = AddedRoute { destination, mask, gateway: GATEWAY_ADDRESS };
+        let route =
+            AddedRoute { destination, mask, gateway: GATEWAY_ADDRESS, interface: Some(ifindex) };
         route.delete(); // stale route from a crashed run
         if let Err(e) = route.add() {
             installed.remove();
@@ -178,6 +258,13 @@ pub fn install(transport: &str, phone_ip: Option<Ipv4Addr>) -> Result<TunnelRout
         return Err(format!("Could not set the adapter DNS to 10.77.0.1: {e}"));
     }
     installed.dns_set = true;
+
+    // Prove it: read the route table and the adapter DNS back. A
+    // mismatch here was invisible in v0.2.1 and is a named abort now.
+    if let Err(e) = verify_install() {
+        installed.remove();
+        return Err(e);
+    }
 
     Ok(installed)
 }

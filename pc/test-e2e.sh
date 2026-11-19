@@ -12,7 +12,9 @@
 #   check 3  the phone's arm switch: unarmed phone refuses the session
 #   check 4  two concurrent flows to the same destination both complete
 #   check 5  a 1 MiB body arrives byte for byte
+#   check 5b MTU regression: no engine packet exceeds the 1400-byte MTU
 #   check 6  an unread flow flooded past the 4 MiB cap is reset
+#   check 7  the connect probes (DNS + TCP through the tunnel) pass
 #
 # No TUN device is needed, so this runs in sandboxes and CI where
 # CAP_NET_ADMIN is unavailable. For the same path over a real TUN device

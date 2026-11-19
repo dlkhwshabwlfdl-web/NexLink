@@ -10,6 +10,12 @@
 //! traffic flows through the phone. Disconnect — or quitting the app —
 //! stops the engine, removes the routes and stops the adapter.
 //!
+//! Since v0.3.0, "Connected" is earned, not asserted: the engine first
+//! pushes a real DNS query and a real TCP open through the tunnel and
+//! only then may the UI show Connected (with live byte counters); the
+//! routes are bound to the adapter and read back after install, and
+//! the adb forward is supervised for the life of a USB tunnel.
+//!
 //! The app must run elevated (administrator): creating the adapter and
 //! changing routes need it. The installed app elevates itself — the
 //! manifest (backlog item 3, `windows-app-manifest.xml`) asks Windows
@@ -38,18 +44,33 @@ mod netutil;
 
 use std::io::Read;
 use std::net::{Ipv4Addr, TcpStream};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, RunEvent, WindowEvent};
+use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 
-use nxcore::engine::client_handshake;
+use nxcore::engine::{client_handshake, TrafficCounters};
 use nxcore::proto::DEFAULT_PORT;
+
+/// Always-on diagnostics: point the nxcore log at
+/// `%APPDATA%/NexLink/nexlink.log` so every run — successful or not —
+/// leaves a trace on the user's PC (v0.2.1 logged only to stderr
+/// behind an env var, so its failing run left nothing to diagnose).
+/// `NXLOG` still adds stderr output on top, for development.
+fn init_logging() {
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = base.join("NexLink").join("nexlink.log");
+    let _ = nxcore::set_log_file(&path);
+    nxcore::nxlog(format!("NexLink {} starting", env!("CARGO_PKG_VERSION")));
+}
 
 /// One live tunnel: the engine thread plus the flag that stops it.
 /// The thread owns the engine, the Wintun device and the routes, and
@@ -59,6 +80,11 @@ struct ActiveTunnel {
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
     summary: String,
+    /// Live DATA byte counters, shared with the engine (status line).
+    counters: TrafficCounters,
+    /// The transport the tunnel was opened with ("usb" / "wifi") —
+    /// the status poll supervises the adb forward for USB tunnels.
+    transport: String,
 }
 
 /// Shared tunnel state, managed by Tauri. Cheap to clone (Arcs inside),
@@ -69,11 +95,18 @@ struct TunnelState {
     /// The last tunnel error (engine died / link lost). Cleared on a
     /// successful connect; survives disconnect so the UI can show it.
     last_error: Arc<Mutex<Option<String>>>,
+    /// When the status poll last verified the adb forward (USB
+    /// supervision is throttled; the poll itself runs every 2 s).
+    last_adb_check: Arc<Mutex<Option<StdInstant>>>,
 }
 
 impl TunnelState {
     fn new() -> Self {
-        TunnelState { inner: Arc::new(Mutex::new(None)), last_error: Arc::new(Mutex::new(None)) }
+        TunnelState {
+            inner: Arc::new(Mutex::new(None)),
+            last_error: Arc::new(Mutex::new(None)),
+            last_adb_check: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Stop the engine thread (if any) and clear the state. Always
@@ -85,6 +118,7 @@ impl TunnelState {
         };
         tunnel.stop.store(true, Ordering::Relaxed);
         let _ = tunnel.thread.join();
+        nxcore::nxlog("tunnel stopped".to_string());
         match self.last_error.lock().unwrap().take() {
             Some(e) => format!("Disconnected. Note: the tunnel had already died: {e}"),
             None => "Disconnected — routes removed, adapter stopped.".to_string(),
@@ -123,6 +157,26 @@ fn run_adb_forward() -> Result<(), String> {
         let _ = output.stderr.as_slice().read_to_string(&mut msg);
         Err(format!("adb forward failed: {}", msg.trim()))
     }
+}
+
+/// Is our `adb forward` still in the adb server's list? The forward
+/// lives in the adb server, not in this process: another platform-tools
+/// install restarting that server (or security software killing it)
+/// makes it silently disappear, and v0.2.1 never noticed. Returns
+/// `None` when adb itself cannot be run or listed — a broken tool is
+/// not proof of a lost forward, so the caller only acts on `Some`.
+fn adb_forward_active() -> Option<bool> {
+    let output = adb_command()
+        .args(["forward", "--list"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Some(netutil::adb_forward_present(&text, DEFAULT_PORT))
 }
 
 /// Reach the phone and do the NXLP handshake. Returns the handshaken
@@ -172,6 +226,13 @@ fn reach_phone(
     Ok((stream, hello, phone_ip))
 }
 
+/// Tell the settings window which connect stage we are in (it shows
+/// the text verbatim) and record it in the log.
+fn emit_stage(app: &tauri::AppHandle, stage: &str) {
+    nxcore::nxlog(format!("connect stage: {stage}"));
+    let _ = app.emit("connect-stage", stage);
+}
+
 /// The Connect button: reach the phone, then (Windows) start the real
 /// tunnel. Runs on a blocking thread — the handshake and the adapter
 /// setup both do blocking I/O.
@@ -180,26 +241,35 @@ async fn connect(app: tauri::AppHandle, transport: String, address: String) -> R
     // Clone the *inner* state (Arcs) — `app.state()` only borrows `app`,
     // which would not live long enough for `spawn_blocking`.
     let state = (*app.state::<TunnelState>()).clone();
-    tauri::async_runtime::spawn_blocking(move || connect_blocking(&state, &transport, &address))
-        .await
-        .map_err(|e| format!("internal error: {e}"))?
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        connect_blocking(&app_handle, &state, &transport, &address)
+    })
+    .await
+    .map_err(|e| format!("internal error: {e}"))?
 }
 
-fn connect_blocking(state: &TunnelState, transport: &str, address: &str) -> Result<String, String> {
+fn connect_blocking(
+    app: &tauri::AppHandle,
+    state: &TunnelState,
+    transport: &str,
+    address: &str,
+) -> Result<String, String> {
     if state.inner.lock().unwrap().is_some() {
         return Err("Already connected — press Disconnect first.".to_string());
     }
     state.last_error.lock().unwrap().take();
+    nxcore::nxlog(format!("connect requested (transport={transport})"));
 
     let (link, hello, phone_ip) = reach_phone(transport, address)?;
 
     #[cfg(windows)]
     {
-        start_tunnel(state, link, hello, transport, phone_ip)
+        start_tunnel(app, state, link, hello, transport, phone_ip)
     }
     #[cfg(not(windows))]
     {
-        let _ = (link, phone_ip);
+        let _ = (app, link, phone_ip);
         Err(format!(
             "Phone found: {} — armed and ready. But the tunnel only runs on the Windows build of NexLink; this build can only check the phone.",
             hello.phone_name
@@ -210,15 +280,23 @@ fn connect_blocking(state: &TunnelState, transport: &str, address: &str) -> Resu
 /// Open the adapter, install the routes, and run the engine on its own
 /// thread. The engine is created *inside* that thread: `Engine` holds
 /// `Rc` state and is `!Send`, so it can never cross a thread boundary.
+///
+/// Since v0.3.0 this only returns `Ok` after the engine's connect
+/// probes have pushed real traffic through the tunnel (a DNS answer
+/// via the phone's interception + a TCP open the phone completed) —
+/// "Connected" is verified, never assumed. A failed probe aborts the
+/// connect with the probe's named stage error, and the engine thread
+/// tears the tunnel down itself.
 #[cfg(windows)]
 fn start_tunnel(
+    app: &tauri::AppHandle,
     state: &TunnelState,
     link: TcpStream,
     hello: nxcore::engine::HelloAckInfo,
     transport: &str,
     phone_ip: Option<Ipv4Addr>,
 ) -> Result<String, String> {
-    use nxcore::engine::Engine;
+    use nxcore::engine::{Engine, ProbeStage};
     use nxcore::Ipv4Address;
     use wintun_backend::{WintunDevice, GATEWAY_ADDRESS};
 
@@ -226,7 +304,9 @@ fn start_tunnel(
         return Err("NexLink must run as administrator to create the virtual adapter and add routes. Right-click NexLink → Run as administrator, then press Connect again.".to_string());
     }
 
+    emit_stage(app, "Opening the virtual adapter…");
     let (device, channels) = WintunDevice::open()?;
+    emit_stage(app, "Installing routes…");
     let tunnel_routes = match routes::install(transport, phone_ip) {
         Ok(r) => r,
         Err(e) => {
@@ -239,6 +319,10 @@ fn start_tunnel(
     let thread_stop = Arc::clone(&stop);
     let last_error = Arc::clone(&state.last_error);
     let summary = format!("{transport} · {}", hello.phone_name);
+    let counters = TrafficCounters::new();
+    let thread_counters = counters.clone();
+    let (probe_tx, probe_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let stage_app = app.clone();
     let thread = std::thread::Builder::new()
         .name("nexlink-engine".to_string())
         .spawn(move || {
@@ -250,8 +334,23 @@ fn start_tunnel(
                     channels.from_engine_tx,
                     link,
                     Ipv4Address::new(gateway[0], gateway[1], gateway[2], gateway[3]),
+                    thread_counters,
                 )?;
-                engine.run(thread_stop)
+                // The probe gate: real traffic first, "Connected" after.
+                let probe = engine.run_probes(&thread_stop, &mut |stage| {
+                    emit_stage(
+                        &stage_app,
+                        match stage {
+                            ProbeStage::Dns => "Verifying DNS…",
+                            ProbeStage::Traffic => "Verifying traffic…",
+                        },
+                    );
+                });
+                let _ = probe_tx.send(probe.clone());
+                match probe {
+                    Ok(()) => engine.run(thread_stop),
+                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                }
             })();
             if let Err(e) = &result {
                 *last_error.lock().unwrap() = Some(e.to_string());
@@ -272,9 +371,52 @@ fn start_tunnel(
         Err(e) => return Err(format!("Could not start the engine thread: {e}")),
     };
 
-    state.inner.lock().unwrap().replace(ActiveTunnel { stop, thread, summary });
+    // Wait for the probe gate. On failure the engine thread has
+    // recorded the error and is tearing the tunnel down; join it so
+    // the routes are gone before the failure is reported.
+    match probe_rx.recv_timeout(Duration::from_secs(45)) {
+        Ok(Ok(())) => {}
+        Ok(Err(stage_err)) => {
+            let _ = thread.join();
+            return Err(stage_err);
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            // The engine thread died before it could report (its real
+            // error is in last_error; it tore the tunnel down itself).
+            let _ = thread.join();
+            let err = state
+                .last_error
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "the engine stopped during verification".to_string());
+            return Err(err);
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            stop.store(true, Ordering::Relaxed);
+            let _ = thread.join();
+            return Err("Verification timed out — the phone did not answer the tunnel checks. Check the phone's connection and press Connect again.".to_string());
+        }
+    }
+
+    // USB supervision starts at birth: the forward the tunnel rides on
+    // must still be there now that everything else checks out.
+    if transport == "usb" && adb_forward_active() == Some(false) {
+        stop.store(true, Ordering::Relaxed);
+        let _ = thread.join();
+        return Err("USB check failed: the adb forward to the phone is not active, so the tunnel has no path to the phone.".to_string());
+    }
+
+    nxcore::nxlog(format!("connected via {transport} to {}", hello.phone_name));
+    state.inner.lock().unwrap().replace(ActiveTunnel {
+        stop,
+        thread,
+        summary,
+        counters,
+        transport: transport.to_string(),
+    });
     Ok(format!(
-        "Connected via {transport} to {} — all PC traffic now goes through your phone (adapter 10.77.0.2, gateway 10.77.0.1). Press Disconnect to stop.",
+        "Connected via {transport} to {} — verified end to end: DNS and traffic are flowing through your phone (adapter 10.77.0.2, gateway 10.77.0.1). Press Disconnect to stop.",
         hello.phone_name
     ))
 }
@@ -290,9 +432,14 @@ async fn disconnect(app: tauri::AppHandle) -> Result<String, String> {
         .map_err(|e| format!("internal error: {e}"))
 }
 
-/// Polled by the window while connected (`connected|<summary>`,
-/// `dead|<error>`, `disconnected`, `disconnected|<last error>`), so a
-/// link that dies on its own shows up in the UI without a click.
+/// Polled by the window while connected
+/// (`connected|<summary>|<bytes down>|<bytes up>`, `dead|<error>`,
+/// `disconnected`, `disconnected|<last error>`), so a link that dies
+/// on its own shows up in the UI without a click. For USB tunnels the
+/// poll also supervises the adb forward (throttled to one check every
+/// few seconds): if it disappears under a live tunnel, the tunnel is
+/// stopped and the loss is surfaced as `dead|…` instead of the UI
+/// showing a false "Connected" forever.
 #[tauri::command]
 fn tunnel_status(state: tauri::State<TunnelState>) -> String {
     let guard = state.inner.lock().unwrap();
@@ -306,7 +453,30 @@ fn tunnel_status(state: tauri::State<TunnelState>) -> String {
                 .unwrap_or_else(|| "the link closed".to_string());
             format!("dead|{err}")
         }
-        Some(t) => format!("connected|{}", t.summary),
+        Some(t) => {
+            if t.transport == "usb" {
+                let due = {
+                    let mut last = state.last_adb_check.lock().unwrap();
+                    match *last {
+                        Some(at) if at.elapsed() < Duration::from_secs(4) => false,
+                        _ => {
+                            *last = Some(StdInstant::now());
+                            true
+                        }
+                    }
+                };
+                if due && adb_forward_active() == Some(false) {
+                    let msg = "the adb forward to the phone disappeared — the USB link was lost"
+                        .to_string();
+                    nxcore::nxlog(format!("connection lost: {msg}"));
+                    t.stop.store(true, Ordering::Relaxed);
+                    *state.last_error.lock().unwrap() = Some(msg.clone());
+                    return format!("dead|{msg}");
+                }
+            }
+            let (down, up) = t.counters.snapshot();
+            format!("connected|{}|{}|{}", t.summary, down, up)
+        }
         None => match state.last_error.lock().unwrap().clone() {
             Some(e) => format!("disconnected|{e}"),
             None => "disconnected".to_string(),
@@ -349,6 +519,7 @@ fn set_autostart(enabled: bool) -> Result<String, String> {
 }
 
 fn main() {
+    init_logging();
     tauri::Builder::default()
         .manage(TunnelState::new())
         .invoke_handler(tauri::generate_handler![
